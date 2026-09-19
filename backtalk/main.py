@@ -347,6 +347,9 @@ CONSOLE_VERBS = {
     "useclaude": ("switch to claude", "use claude",
                   "switch to the claude brain", "emergency claude",
                   "escalate to claude"),
+    "usedeepseek": ("switch to deep reasoning", "use deep reasoning",
+                    "switch to deepseek", "use deepseek",
+                    "deep reasoning mode", "think harder"),
     "whichbrain": ("which brain are you using", "what brain is this",
                    "which brain is active", "what brain are you on",
                    "brain status", "which brain"),
@@ -948,6 +951,24 @@ async def amain():
                 except (BrainDisabledError, BrainUnavailableError) as e:
                     line = f"Couldn't switch to Qwen: {e}"[:300]
             log(f"[console] useqwen -> {line}")
+            mouth.say(line)
+        elif verb == "usedeepseek":
+            resp = ""
+            if router.active_id == "deepseek-r1-8b-local":
+                line = "Already on DeepSeek local reasoning."
+            else:
+                try:
+                    await router.activate("deepseek-r1-8b-local")
+                    # Required announcement, verbatim, every time this
+                    # brain becomes active: never a silent swap.
+                    line = ("DeepSeek local reasoning, online. It's "
+                            "local and free, same as Qwen, but slower "
+                            "-- it thinks before it answers. Say "
+                            "switch to Qwen when you want the fast "
+                            "brain back.")
+                except (BrainDisabledError, BrainUnavailableError) as e:
+                    line = f"Couldn't switch to deep reasoning: {e}"[:300]
+            log(f"[console] usedeepseek -> {line}")
             mouth.say(line)
         elif verb == "useclaude":
             resp = ""
