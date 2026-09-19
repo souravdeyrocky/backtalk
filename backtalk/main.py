@@ -76,6 +76,7 @@ import threading
 import time
 
 from backtalk import signals
+from backtalk.brains import brain_intent
 from backtalk.brains import config as brain_router_config
 from backtalk.brains.base import BrainDisabledError, BrainUnavailableError
 from backtalk.config import CFG
@@ -1007,6 +1008,19 @@ async def amain():
                         "shouldn't happen. Check the log.")
             log(f"[console] whichbrain -> {line}")
             mouth.say(line)
+        elif verb == "cloudbrain":
+            resp = ""
+            # Never a direct activation: this path only ever informs
+            # and points at the exact confirm-gated phrase. Gemini is
+            # what "cloud brain" means here; Claude has its own name
+            # and its own exact phrase already.
+            line = ("Gemini is disabled -- no API key is configured, "
+                    "so that cloud brain isn't available. I can "
+                    "switch to Claude instead, which needs your "
+                    "explicit confirmation every time. Say switch to "
+                    "Claude if you'd like that.")
+            log(f"[console] cloudbrain -> {line}")
+            mouth.say(line)
         else:
             resp = ""
         if say_after:
@@ -1085,7 +1099,13 @@ async def amain():
             except Exception:
                 pass
             speak_task = None
-        verb = verb or console_match(text)
+        # The strict exact-phrase console verbs try first (cheapest,
+        # zero false-positive risk); brain_intent is the tolerant
+        # fallback for natural phrasing ("Hello Jarvis, which brain
+        # are you using?") that console_match() was never built to
+        # survive -- see brain_intent's module docstring for the real
+        # field-test failures this closes.
+        verb = verb or console_match(text) or brain_intent.detect(text)
         if verb:
             await run_console(verb)
             return True
