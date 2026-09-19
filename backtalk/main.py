@@ -17,10 +17,16 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """backtalk — talk to your Claude Code agent out loud.
 
-Flow: hold the key and speak -> local transcription -> your agent's warm
-Claude session streams the reply -> sentences go to the mouth the moment
-they complete (~1-2s to first audio on warm turns). The greeting plays
-over a hidden warmup query so the first real turn is already hot.
+Flow: hold the key and speak -> local transcription -> your agent's
+ACTIVE BRAIN streams the reply -> sentences go to the mouth the moment
+they complete. Which brain answers is selected by a BrainRouter
+(backtalk.router): Qwen3 8B Local by default (free, on-device, no
+tools), Claude only as an explicit, confirm-gated emergency escalation
+(the full Agent SDK toolset, consumes your subscription usage). The
+identity, the vault, the permission gate, the voice, and the face are
+all the same regardless of which brain is answering -- only the brain
+changes. The greeting plays over a hidden warmup query so the first
+real turn is already hot.
 
 Typing in this terminal is a first-class turn too: same conversation,
 spoken reply, and typing while it talks interrupts it.
@@ -28,13 +34,21 @@ spoken reply, and typing while it talks interrupts it.
 THE VOICE CONSOLE: exact phrases, spoken (or typed) alone, control the
 session itself so you never go back to the keyboard: "clear the
 session" / "compact the session" / "switch to the deep model" / "back
-to the fast model" / "set effort to low" (or medium, high, max) /
-"usage report" / "go hands free" and "push to talk mode" (the MIC) /
-"stop asking for permission" and "start asking again" (permissions,
-called auto-approve, a different axis than the microphone on purpose).
-And with permission_mode "ask" (the default), gated tool calls ASK OUT
+to the fast model" / "set effort to low" (or medium, high, max) --
+these five are Claude-only and say so honestly when a local brain is
+active / "usage report" / "go hands free" and "push to talk mode" (the
+MIC) / "stop asking for permission" and "start asking again"
+(permissions, called auto-approve, a different axis than the
+microphone on purpose) / "switch to Qwen" (immediate, no confirm) /
+"switch to Claude" (always needs a spoken confirm, every time, no
+exceptions) / "which brain are you using" (a truthful status readout,
+brain identity and what it can actually do). And with permission_mode
+"ask" (the default), gated tool calls Claude wants to make ASK OUT
 LOUD and your spoken yes or no decides them; any other answer is
-passed back to the agent as the reason.
+passed back to the agent as the reason. A brain with no tools (Qwen,
+DeepSeek) never gets asked, because it never has anything gated to
+ask about -- and if you ask it to do something that needs a tool, it
+says so and points you at "switch to Claude" instead of pretending.
 
 Flags:
   --open-mic   start in hands-free listening for this session (the
@@ -62,12 +76,14 @@ import threading
 import time
 
 from backtalk import signals
-from backtalk.brain import WarmBrain
+from backtalk.brains import config as brain_router_config
+from backtalk.brains.base import BrainDisabledError, BrainUnavailableError
 from backtalk.config import CFG
 from backtalk.ears import (Ears, explain_audio_failure, record_held,
                            warm as warm_ears)
 from backtalk.mouth import Mouth
 from backtalk.ptt import PTTListener
+from backtalk.router import BrainRouter, ConfirmRequiredError
 from backtalk.vlog import log
 
 NAME = CFG["name"]
@@ -325,6 +341,15 @@ CONSOLE_VERBS = {
                   "auto approve mode"),
     "ask":       ("start asking again", "ask before acting",
                   "ask for permission again"),
+    "useqwen":   ("switch to qwen", "use qwen", "back to qwen",
+                  "switch to the local brain", "use the local model",
+                  "switch to local", "local brain"),
+    "useclaude": ("switch to claude", "use claude",
+                  "switch to the claude brain", "emergency claude",
+                  "escalate to claude"),
+    "whichbrain": ("which brain are you using", "what brain is this",
+                   "which brain is active", "what brain are you on",
+                   "brain status", "which brain"),
 }
 _EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
@@ -579,10 +604,12 @@ def _typed_reader(q: "queue.Queue[str]"):
                 sys.stdout.flush()
 
 
-async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
+async def speak_reply(router: BrainRouter, mouth: Mouth, text: str):
     """First sentence ships alone (fast start); the rest go in
     2-sentence breaths — fuller chunks get livelier prosody (single
-    short sentences come out flat)."""
+    short sentences come out flat). `router` picks the sentences up
+    from whichever brain is currently active -- this function has no
+    idea which one that is, and doesn't need to."""
     t0 = time.time()
     first = True
     batch: list[str] = []
@@ -620,7 +647,7 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
                 batch = []
 
     try:
-        async for sentence in brain.ask_stream(text):
+        async for sentence in router.ask_stream(text):
             emit(sentence)
         if batch:
             mouth.say_chunk(" ".join(batch), pending)
@@ -632,7 +659,7 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
             signals.set_state("idle")
     except asyncio.CancelledError:
         try:
-            await brain.interrupt()
+            await router.interrupt()
         except Exception:
             pass
         raise
@@ -664,34 +691,70 @@ async def amain():
 
     mouth = Mouth()
     ears = Ears()
-    brain = WarmBrain(model=model,
-                      can_use_tool=make_permission_gate(mouth),
-                      resume_id=resume_id)
+    brain_cfg = brain_router_config.load()
+    if model:
+        # --model only ever meant "override Claude's model id for this
+        # session" -- Qwen/DeepSeek don't take this kind of override,
+        # so it's applied to the router config's claude entry only,
+        # never silently reinterpreted for whichever brain happens to
+        # be active.
+        brain_cfg.setdefault("brains", {}).setdefault("claude", {})["model"] = model
+    router = BrainRouter(config=brain_cfg,
+                         can_use_tool=make_permission_gate(mouth),
+                         resume_id=resume_id)
+    default_id = brain_cfg.get("active_brain") or "qwen3-8b-local"
+    default_brain = router.get(default_id)
+    # RECOVERY MODE: the owner pointed brain_router.json's active_brain
+    # at a gated brain (Claude) directly. That is a deliberate, offline
+    # config edit -- not a live spoken "switch to Claude" -- so booting
+    # trusts the config file itself as the approval and skips the
+    # interactive confirm for THIS ONE boot-time activation only. It
+    # must never be quiet about doing that: every recovery boot is both
+    # logged and spoken, unmistakably, before anything else happens. A
+    # LIVE "switch to Claude" later in this same session still always
+    # goes through the real spoken confirm below -- recovery mode never
+    # weakens that.
+    recovery_mode = default_brain.requires_confirm_to_switch
+    if recovery_mode:
+        log(f"[backtalk] RECOVERY MODE: booting directly into "
+            f"{default_brain.label} because brain_router.json's "
+            f"active_brain is {default_id!r}. This bypasses the live "
+            f"spoken confirm because the config file itself is the "
+            f"approval -- a live 'switch to Claude' later in this "
+            f"session still requires the spoken confirm as normal.")
 
     mode = ("hands-free listening (the talk key still works)"
             if _MIC["mode"] == "open"
             else f"push-to-talk ({CFG['ptt_key']})")
     log(f"[backtalk] up — agent={NAME} dir={CFG['agent_dir']} "
-        f"model={brain.model} mic={mode} "
+        f"brain={default_brain.label} mic={mode} "
         f"(say 'goodbye {NAME.lower()}' to hang up)")
     mouth.say(CFG["greeting"])
+    if recovery_mode:
+        mouth.say(f"Heads up — recovery mode. I'm booting straight "
+                  f"into {default_brain.label} because that's what "
+                  f"your config says, not because you approved it out "
+                  f"loud this session.")
 
     loop = asyncio.get_event_loop()
     # Warm the engines while the greeting plays: the STT model load and
     # the brain's prompt-cache toll both hide behind the spoken line.
     loop.run_in_executor(None, warm_ears)
-    # THE BRAIN CONNECT, guarded. This is the one startup step that
-    # needs a signed-in Claude Code, internet, and available usage.
-    # When it fails or hangs, the mouth still works, so SAY SO instead
-    # of dying silently with the face stuck on idle (a real field
-    # case: the greeting played, then nothing, and on Windows the
-    # window closed before anyone could read the error).
+    # THE BRAIN CONNECT, guarded. For Claude this is the one startup
+    # step that needs a signed-in Claude Code, internet, and available
+    # usage; for a local brain it needs Ollama reachable and the model
+    # pulled. Either way, when it fails or hangs, the mouth still
+    # works, so SAY SO instead of dying silently with the face stuck
+    # on idle (a real field case: the greeting played, then nothing,
+    # and on Windows the window closed before anyone could read the
+    # error).
     log("[backtalk] connecting the brain...")
     try:
-        await asyncio.wait_for(brain.start(), 120)
+        await asyncio.wait_for(
+            router.activate(default_id, confirmed=True), 120)
 
         async def _warmup():
-            async for _ in brain.ask_stream(
+            async for _ in router.ask_stream(
                     "Warmup ping - reply with the single word: ready"):
                 pass
         await asyncio.wait_for(_warmup(), 180)
@@ -699,22 +762,25 @@ async def amain():
         kind = ("timed out" if isinstance(e, asyncio.TimeoutError)
                 else f"failed: {e!r}"[:220])
         log(f"[backtalk] BRAIN CONNECT {kind}")
-        mouth.say("Bad news. The voice and the face are fine, but I "
-                  "couldn't reach my brain, the Claude Code session. "
-                  "Check this window for the error. The usual causes: "
-                  "Claude Code isn't signed in, the internet is down, "
-                  "or the plan is out of usage.")
+        mouth.say(f"Bad news. The voice and the face are fine, but I "
+                  f"couldn't reach my brain, {default_brain.label}. "
+                  f"Check this window for the error: {e}"[:400])
         mouth.wait_done(timeout=30)
         raise SystemExit(1)
     log("[backtalk] brain warm")
     # the hidden warmup ping is plumbing, not conversation
-    brain.session.update(turns=0, out_tokens=0, in_tokens=0, cost=0.0)
+    router.session.update(turns=0, out_tokens=0, in_tokens=0, cost=0.0)
     # a configured effort level applies at launch (saved by the spoken
     # "set effort to X", or written by the person's agent on request)
+    # -- Claude-only; a local brain has no equivalent, so this is
+    # skipped rather than silently pretending it did something.
     boot_effort = str(CFG.get("effort") or "").strip().lower()
-    if boot_effort in _EFFORTS:
-        await brain.command(f"/effort {boot_effort}")
+    if boot_effort in _EFFORTS and router.active_id == "claude":
+        await router.command(f"/effort {boot_effort}")
         log(f"[backtalk] effort set to {boot_effort} (from config)")
+    elif boot_effort and router.active_id != "claude":
+        log(f"[backtalk] effort {boot_effort!r} in config skipped -- "
+            f"not on Claude, no equivalent to set")
     elif boot_effort:
         log(f"[backtalk] ignoring unknown effort {boot_effort!r} in config")
 
@@ -737,37 +803,65 @@ async def amain():
 
     async def _run_console_inner(verb):
         _deny_pending()
-        await brain.reset_turn()
+        await router.reset_turn()
         say_after = None
+
+        def _claude_only_refusal(what):
+            active = router.status().brains.get(router.active_id)
+            active_label = active.label if active else "no brain"
+            return (f"There's no {what} on {active_label} -- that's a "
+                    f"Claude console command. Say switch to Claude "
+                    f"first if you want it.")
+
         if verb == "clear":
-            resp = await brain.command("/clear")
-            say_after = "Cleared. Fresh slate."
+            if router.active_id != "claude":
+                resp = ""
+                say_after = _claude_only_refusal("session to clear")
+            else:
+                resp = await router.command("/clear")
+                say_after = "Cleared. Fresh slate."
         elif verb == "compact":
-            mouth.say("Compacting. One moment.")
-            resp = await brain.command("/compact")
-            say_after = "Compacted. Same conversation, smaller footprint."
+            if router.active_id != "claude":
+                resp = ""
+                say_after = _claude_only_refusal("session to compact")
+            else:
+                mouth.say("Compacting. One moment.")
+                resp = await router.command("/compact")
+                say_after = "Compacted. Same conversation, smaller footprint."
         elif verb == "deep":
-            mouth.say("Switching to the deep model. Heads up, replies "
-                      "get slower. Say back to the fast model when "
-                      "you're done.")
-            resp = await brain.command(f"/model {CFG['deep_model']}")
-            say_after = "Deep model online, for this session only."
+            if router.active_id != "claude":
+                resp = ""
+                say_after = _claude_only_refusal("deep model to switch to")
+            else:
+                mouth.say("Switching to the deep model. Heads up, replies "
+                          "get slower. Say back to the fast model when "
+                          "you're done.")
+                resp = await router.command(f"/model {CFG['deep_model']}")
+                say_after = "Deep model online, for this session only."
         elif verb == "fast":
-            resp = await brain.command(f"/model {CFG['model']}")
-            say_after = "Back on the fast model."
+            if router.active_id != "claude":
+                resp = ""
+                say_after = _claude_only_refusal("fast/deep model switch")
+            else:
+                resp = await router.command(f"/model {CFG['model']}")
+                say_after = "Back on the fast model."
         elif verb.startswith("effort:"):
             lvl = verb.split(":", 1)[1]
-            resp = await brain.command(f"/effort {lvl}")
-            saved = _write_config_key("effort", lvl)
-            say_after = (f"Effort set to {lvl}, and saved as your "
-                         "default." if saved else
-                         f"Effort set to {lvl} for this session. The "
-                         "config file couldn't be written, so it won't "
-                         "stick past a restart.")
+            if router.active_id != "claude":
+                resp = ""
+                say_after = _claude_only_refusal("effort level to set")
+            else:
+                resp = await router.command(f"/effort {lvl}")
+                saved = _write_config_key("effort", lvl)
+                say_after = (f"Effort set to {lvl}, and saved as your "
+                             "default." if saved else
+                             f"Effort set to {lvl} for this session. The "
+                             "config file couldn't be written, so it "
+                             "won't stick past a restart.")
         elif verb == "usage":
             resp = ""
-            mouth.say(_spoken_usage(brain.session,
-                                    await brain.context_usage()))
+            mouth.say(_spoken_usage(router.session,
+                                    await router.context_usage()))
         elif verb == "micopen":
             resp = ""
             if _MIC["mode"] == "open":
@@ -826,7 +920,7 @@ async def amain():
                 # allowed live). If that fails, saying "done" would be
                 # a lie: the agent would keep acting silently.
                 try:
-                    await brain.set_permission_mode("ask")
+                    await router.set_permission_mode("ask")
                 except Exception as e:
                     flipped = False
                     log(f"[console] live flip to ask FAILED: {e}")
@@ -843,6 +937,55 @@ async def amain():
                 mouth.say("I saved asking as your default, but this "
                           "session couldn't switch over. Restart the "
                           "voice line to get asking back.")
+        elif verb == "useqwen":
+            resp = ""
+            if router.active_id == "qwen3-8b-local":
+                line = "Already on Qwen."
+            else:
+                try:
+                    await router.activate("qwen3-8b-local")
+                    line = "Switched to Qwen, local and free."
+                except (BrainDisabledError, BrainUnavailableError) as e:
+                    line = f"Couldn't switch to Qwen: {e}"[:300]
+            log(f"[console] useqwen -> {line}")
+            mouth.say(line)
+        elif verb == "useclaude":
+            resp = ""
+            if router.active_id == "claude":
+                line = "Already on Claude."
+            else:
+                _CONFIRM["verb"] = "useclaude"
+                _CONFIRM["at"] = time.monotonic()
+                line = ("Switching to Claude uses your subscription "
+                        "usage and needs your approval every single "
+                        "time -- it's never saved as a default. Say "
+                        "confirm to switch, just for this session.")
+            log(f"[console] useclaude -> {line}")
+            mouth.say(line)
+        elif verb == "useclaude:confirmed":
+            resp = ""
+            try:
+                await router.activate("claude", confirmed=True)
+                line = ("Claude online for this session. Say switch "
+                        "to Qwen any time to go back.")
+            except (BrainDisabledError, BrainUnavailableError,
+                    ConfirmRequiredError) as e:
+                line = f"Couldn't reach Claude: {e}"[:300]
+            log(f"[console] useclaude:confirmed -> {line}")
+            mouth.say(line)
+        elif verb == "whichbrain":
+            resp = ""
+            status = router.status()
+            active = (status.brains.get(status.active_id)
+                     if status.active_id else None)
+            if active:
+                line = (f"You're on {active.label}. It handles "
+                       f"{active.capability_summary}")
+            else:
+                line = ("No brain is active right now, which "
+                        "shouldn't happen. Check the log.")
+            log(f"[console] whichbrain -> {line}")
+            mouth.say(line)
         else:
             resp = ""
         if say_after:
@@ -909,11 +1052,11 @@ async def amain():
             speak_task.cancel()
             mouth.shut_up()
         if speak_task:
-            # Let the cancellation fully land (its brain.interrupt()
-            # included) BEFORE anything else touches the brain —
+            # Let the cancellation fully land (its router.interrupt()
+            # included) BEFORE anything else touches the router —
             # otherwise the dead turn's stop signal can race in after
             # the new query and kill the new answer (half of the
-            # off-by-one bug; see brain.reset_turn for the other half).
+            # off-by-one bug; see router.reset_turn for the other half).
             try:
                 await speak_task
             except asyncio.CancelledError:
@@ -932,8 +1075,8 @@ async def amain():
         # that fired in the meantime resolves first, or the drain would
         # wait on a ResultMessage the CLI is withholding for an answer.
         _deny_pending()
-        await brain.reset_turn()
-        speak_task = asyncio.create_task(speak_reply(brain, mouth, text))
+        await router.reset_turn()
+        speak_task = asyncio.create_task(speak_reply(router, mouth, text))
         return True
 
     try:
@@ -1058,7 +1201,7 @@ async def amain():
         mouth.shutdown()  # restores the music on Ctrl-C / crash paths too
         signals.static_stop()
         signals.set_state("idle")
-        await brain.stop()
+        await router.shutdown()
         log("[backtalk] hung up")
 
 

@@ -62,7 +62,13 @@ class BrainStatus:
     when it's neither. Whether this brain is the ACTIVE one is not
     stored here -- that lives in exactly one place, RouterStatus.active_id
     in router.py, so there is never a second copy of that fact to drift
-    out of sync."""
+    out of sync.
+
+    capability_summary is the honest capability matrix, in one spoken-
+    ready sentence: what this brain can ACTUALLY do right now, not what
+    it might do once more is built. A brain must never claim a
+    capability (file edits, commands, browsing, vault writes) it does
+    not really have behind an explicit permission gate."""
     id: str
     label: str
     enabled: bool
@@ -70,6 +76,7 @@ class BrainStatus:
     reason: str = ""
     requires_tools: bool = False
     requires_confirm_to_switch: bool = False
+    capability_summary: str = ""
 
 
 class BrainAdapter:
@@ -80,6 +87,7 @@ class BrainAdapter:
     label: str = "Base brain (do not use directly)"
     requires_tools: bool = False
     requires_confirm_to_switch: bool = False
+    capability_summary: str = "no capabilities declared"
 
     def __init__(self, *, enabled: bool = False):
         self.enabled = enabled
@@ -124,6 +132,7 @@ class BrainAdapter:
                 reason="disabled by configuration",
                 requires_tools=self.requires_tools,
                 requires_confirm_to_switch=self.requires_confirm_to_switch,
+                capability_summary=self.capability_summary,
             )
         h = self._last_health
         return BrainStatus(
@@ -132,6 +141,7 @@ class BrainAdapter:
             reason=(h.reason if h else "not checked yet"),
             requires_tools=self.requires_tools,
             requires_confirm_to_switch=self.requires_confirm_to_switch,
+            capability_summary=self.capability_summary,
         )
 
     async def start(self) -> None:

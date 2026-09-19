@@ -35,12 +35,23 @@ class ClaudeBrain(BrainAdapter):
     label = "Claude (Agent SDK -- consumes your subscription usage)"
     requires_tools = True
     requires_confirm_to_switch = True
+    capability_summary = (
+        "the full Claude Agent SDK toolset -- file edits, running "
+        "commands, web fetch, and vault writes -- every one of them "
+        "gated by the spoken permission check before it acts.")
 
     def __init__(self, *, enabled: bool = False, model: str | None = None,
-                can_use_tool=None):
+                can_use_tool=None, resume_id: str | None = None):
         super().__init__(enabled=enabled)
         self._model = model
         self._can_use_tool = can_use_tool
+        # Consumed once, naturally: self._warm is only ever constructed
+        # the first time start() runs, whether that's at boot (recovery
+        # mode) or later via a live "switch to Claude" -- so a saved
+        # resume_last_session id is honored exactly once per backtalk
+        # launch, matching the original WarmBrain behavior this adapter
+        # wraps.
+        self._resume_id = resume_id
         self._warm: WarmBrain | None = None
 
     async def _check_health(self) -> BrainHealth:
@@ -59,7 +70,8 @@ class ClaudeBrain(BrainAdapter):
             raise BrainDisabledError("claude is disabled by configuration")
         if self._warm is None:
             self._warm = WarmBrain(model=self._model,
-                                   can_use_tool=self._can_use_tool)
+                                   can_use_tool=self._can_use_tool,
+                                   resume_id=self._resume_id)
         await self._warm.start()
         self._started = True
 

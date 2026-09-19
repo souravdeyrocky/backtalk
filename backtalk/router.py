@@ -32,6 +32,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from backtalk.brains import config as router_config
+from backtalk.brains import tool_intent, vault_context
 from backtalk.brains.base import (
     BrainAdapter,
     BrainDisabledError,
@@ -66,13 +67,16 @@ class RouterStatus:
     brains: dict[str, BrainStatus] = field(default_factory=dict)
 
 
-def _build_registry(cfg: dict, *, can_use_tool=None) -> dict[str, BrainAdapter]:
+def _build_registry(cfg: dict, *, can_use_tool=None,
+                    resume_id=None) -> dict[str, BrainAdapter]:
     b = cfg["brains"]
     return {
         "qwen3-8b-local": QwenBrain(
-            enabled=b.get("qwen3-8b-local", {}).get("enabled", False)),
+            enabled=b.get("qwen3-8b-local", {}).get("enabled", False),
+            context_loader=vault_context.load_context),
         "deepseek-r1-8b-local": DeepSeekBrain(
-            enabled=b.get("deepseek-r1-8b-local", {}).get("enabled", False)),
+            enabled=b.get("deepseek-r1-8b-local", {}).get("enabled", False),
+            context_loader=vault_context.load_context),
         "gemini": GeminiBrain(
             enabled=b.get("gemini", {}).get("enabled", False),
             api_key_env=b.get("gemini", {}).get("api_key_env",
@@ -80,14 +84,17 @@ def _build_registry(cfg: dict, *, can_use_tool=None) -> dict[str, BrainAdapter]:
         "claude": ClaudeBrain(
             enabled=b.get("claude", {}).get("enabled", False),
             model=b.get("claude", {}).get("model"),
-            can_use_tool=can_use_tool),
+            can_use_tool=can_use_tool,
+            resume_id=resume_id),
     }
 
 
 class BrainRouter:
-    def __init__(self, *, config: dict | None = None, can_use_tool=None):
+    def __init__(self, *, config: dict | None = None, can_use_tool=None,
+                resume_id=None):
         self._cfg = config if config is not None else router_config.load()
-        self._brains = _build_registry(self._cfg, can_use_tool=can_use_tool)
+        self._brains = _build_registry(self._cfg, can_use_tool=can_use_tool,
+                                       resume_id=resume_id)
         self._active_id: str | None = None
 
     @property
@@ -161,9 +168,50 @@ class BrainRouter:
     async def ask_stream(self, utterance: str):
         if not self._active_id:
             raise NoBrainActiveError("no brain has been activated yet")
-        async for sentence in self._brains[self._active_id].ask_stream(
+        active = self._brains[self._active_id]
+        # THE HONESTY GATE: a brain with no tools never gets to answer
+        # a plainly tool-shaped request in prose as if it had done the
+        # thing, and it never silently switches brains on its own. It
+        # refuses, out loud, through the exact same reply channel as
+        # any other sentence, and names the one phrase that actually
+        # gets something done about it.
+        if not active.requires_tools and tool_intent.looks_like_tool_request(
                 utterance):
+            yield tool_intent.REFUSAL
+            return
+        async for sentence in active.ask_stream(utterance):
             yield sentence
+
+    @property
+    def session(self) -> dict:
+        """Usage bookkeeping for the ACTIVE brain, or a zeroed dict when
+        nothing is active -- main.py's "usage report" console verb reads
+        this the same way it used to read WarmBrain.session directly."""
+        if self._active_id:
+            return self._brains[self._active_id].session
+        return {"turns": 0, "out_tokens": 0, "in_tokens": 0, "cost": 0.0}
+
+    async def interrupt(self) -> None:
+        if self._active_id:
+            await self._brains[self._active_id].interrupt()
+
+    async def reset_turn(self, timeout: float = 8.0) -> None:
+        if self._active_id:
+            await self._brains[self._active_id].reset_turn(timeout)
+
+    async def command(self, cmd: str) -> str:
+        if not self._active_id:
+            raise NoBrainActiveError("no brain has been activated yet")
+        return await self._brains[self._active_id].command(cmd)
+
+    async def set_permission_mode(self, mode: str) -> None:
+        if self._active_id:
+            await self._brains[self._active_id].set_permission_mode(mode)
+
+    async def context_usage(self):
+        if not self._active_id:
+            return None
+        return await self._brains[self._active_id].context_usage()
 
     async def shutdown(self) -> None:
         if self._active_id:

@@ -38,6 +38,9 @@ class GeminiBrain(BrainAdapter):
     label = "Gemini (external -- your own free tier, approval required)"
     requires_tools = False
     requires_confirm_to_switch = True
+    capability_summary = (
+        "no capabilities yet -- Gemini is a stub with no live request "
+        "path built, and no API key configured.")
 
     def __init__(self, *, enabled: bool = False,
                 api_key_env: str = "GEMINI_API_KEY"):

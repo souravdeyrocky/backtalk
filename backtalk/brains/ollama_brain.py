@@ -54,10 +54,25 @@ class OllamaBrain(BrainAdapter):
     requires_tools = False
     requires_confirm_to_switch = False
     model: str = ""
+    # The honest capability matrix (see base.BrainStatus): this brain
+    # can talk and read a bounded vault excerpt. It must never claim
+    # file edits, commands, browsing, or vault writes -- those aren't
+    # implemented behind any permission gate here, so the router's
+    # tool_intent check refuses those requests before they ever reach
+    # this class, and this system prompt below says the same thing to
+    # the model itself as a second line of defense.
+    capability_summary = (
+        "local conversation and a read-only excerpt of your vault (the "
+        "index, your profile, and today's daily note). It cannot edit "
+        "files, run commands, browse the web, or write to your vault -- "
+        "those need Claude.")
 
-    def __init__(self, *, enabled: bool = False, system_prompt: str = ""):
+    def __init__(self, *, enabled: bool = False, context_loader=None):
         super().__init__(enabled=enabled)
-        self._system_prompt = system_prompt
+        # Called fresh on every turn, never cached at construction --
+        # so a same-day vault edit shows up on the next turn without a
+        # restart. None means "no vault context at all" (e.g. tests).
+        self._context_loader = context_loader
 
     async def _check_health(self) -> BrainHealth:
         try:
@@ -79,10 +94,20 @@ class OllamaBrain(BrainAdapter):
         if not self.enabled:
             raise BrainDisabledError(
                 f"{self.id} is disabled by configuration")
-        messages = []
-        if self._system_prompt:
-            messages.append({"role": "system", "content": self._system_prompt})
-        messages.append({"role": "user", "content": utterance})
+        vault_ctx = self._context_loader() if self._context_loader else ""
+        preamble = (
+            "You are Jarvis, a local AI assistant running entirely "
+            "on-device through Ollama. No part of this conversation "
+            "leaves this machine. You have NO tools: you cannot edit "
+            "files, run commands, browse the web, or write to the "
+            "vault. If asked to do one of those, say so plainly and "
+            "suggest switching to Claude instead of pretending to do it.")
+        system_prompt = (
+            f"{preamble} Use the following vault context if relevant; "
+            f"do not invent facts beyond it.\n\n{vault_ctx}"
+            if vault_ctx else preamble)
+        messages = [{"role": "system", "content": system_prompt},
+                   {"role": "user", "content": utterance}]
         payload = {"model": self.model, "messages": messages, "stream": True}
         buf = ""
         self.session["turns"] += 1
