@@ -13,6 +13,10 @@ uv.lock
 backtalk.egg-info/
 # your personal config, created at setup: never tracked, never touched by updates
 backtalk.json
+# same story for the brain router's own config -- every brain ships off
+# by default (see brain_router.json.example), and this file is where you
+# turn one on for real
+brain_router.json
 
 # Other agents' configs living beside this one. They are not backtalk's, they are
 # not the user's copy of backtalk's, and nothing here should ever carry them.

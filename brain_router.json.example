@@ -1,0 +1,9 @@
+{
+  "active_brain": null,
+  "brains": {
+    "qwen3-8b-local": { "enabled": false },
+    "deepseek-r1-8b-local": { "enabled": false },
+    "gemini": { "enabled": false, "api_key_env": "GEMINI_API_KEY" },
+    "claude": { "enabled": false, "model": null }
+  }
+}
