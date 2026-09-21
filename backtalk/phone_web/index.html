@@ -1,0 +1,962 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Jarvis — Phone</title>
+<style>
+  :root {
+    --bg: #0b0f10; --panel: #12181a; --line: #223033; --ink: #eafffb;
+    --dim: #7fa9a2; --cyan: #00e5ff; --orange: #ff8c3c; --green: #39ffb0;
+    --red: #ff5a5a;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  body { padding: env(safe-area-inset-top) 16px env(safe-area-inset-bottom) 16px; }
+  h1 { font-size: 18px; letter-spacing: 0.04em; margin: 16px 0 4px; }
+  .sub { color: var(--dim); font-size: 12px; margin-bottom: 16px; }
+  .card { background: var(--panel); border: 1px solid var(--line);
+    border-radius: 12px; padding: 14px; margin-bottom: 12px; }
+  input, button, textarea { font: inherit; }
+  input[type=text] { width: 100%; padding: 10px 12px; border-radius: 8px;
+    border: 1px solid var(--line); background: #0e1416; color: var(--ink); }
+  button { padding: 10px 14px; border-radius: 8px; border: 1px solid var(--line);
+    background: #16211f; color: var(--ink); cursor: pointer; }
+  button:active { transform: scale(0.98); }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .row > * { flex: 1 1 auto; min-width: 0; }
+  .pill { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px;
+    border-radius: 999px; background: #0e1416; border: 1px solid var(--line);
+    font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); }
+  .state-idle .dot { background: var(--dim); }
+  .state-listening .dot { background: var(--cyan); box-shadow: 0 0 8px var(--cyan); }
+  .state-thinking .dot { background: var(--orange); box-shadow: 0 0 8px var(--orange); }
+  .state-speaking .dot { background: var(--green); box-shadow: 0 0 8px var(--green); }
+  #transcript { max-height: 42vh; overflow-y: auto; display: flex;
+    flex-direction: column; gap: 8px; }
+  .line { padding: 8px 10px; border-radius: 8px; background: #0e1416; }
+  .line .who { font-size: 11px; color: var(--dim); margin-bottom: 2px; }
+  .line.jarvis { border-left: 3px solid var(--cyan); }
+  .line.captain { border-left: 3px solid var(--green); }
+  #permBanner { display: none; background: #241a12; border: 1px solid var(--orange);
+    border-radius: 10px; padding: 12px; margin-bottom: 12px; }
+  #permBanner button.yes { background: #123020; border-color: var(--green); }
+  #permBanner button.no { background: #301212; border-color: var(--red); }
+  #micBtn { width: 100%; padding: 16px; font-size: 16px; }
+  #micBtn.recording { background: #301212; border-color: var(--red); }
+  #micBtn:disabled { opacity: 0.45; cursor: not-allowed; }
+  #pairView, #appView { display: none; }
+  .hint { color: var(--dim); font-size: 12px; margin-top: 6px; }
+  .err { color: var(--red); font-size: 13px; margin-top: 8px; }
+  .mono { font-family: "SF Mono", Menlo, monospace; font-size: 11px; }
+</style>
+</head>
+<body>
+<h1>JARVIS</h1>
+<div class="sub">Phone access via Tailscale — secure connection, voice enabled</div>
+
+<div id="pairView" class="card">
+  <div style="margin-bottom:10px;">This phone isn't paired yet.</div>
+  <label for="pairCode" style="display:block; font-size:12px; color:var(--dim); margin-bottom:4px;">Pairing code (from the desktop terminal)</label>
+  <div class="row" style="margin-bottom:8px;">
+    <input id="pairCode" type="text" placeholder="e.g. 7WJJ5WY7" maxlength="8"
+           autocapitalize="characters" autocomplete="one-time-code"
+           autocorrect="off" spellcheck="false" inputmode="text"
+           style="font-family:'SF Mono',Menlo,monospace; font-size:20px; letter-spacing:0.12em; text-align:center;">
+  </div>
+  <label for="pairLabel" style="display:block; font-size:12px; color:var(--dim); margin-bottom:4px;">Label this phone (optional)</label>
+  <div class="row" style="margin-bottom:8px;">
+    <input id="pairLabel" type="text" placeholder="e.g. S23 Ultra" autocomplete="off"
+           autocorrect="off" spellcheck="false">
+  </div>
+  <button id="pairBtn" style="width:100%; background:var(--cyan); color:#02171a; font-weight:600; border-color:var(--cyan);">Pair this phone</button>
+  <div class="hint">On the desktop, say or type "pair a phone" to get a fresh code. Codes expire after 3 minutes and can only be used once.</div>
+  <div id="pairErr" class="err"></div>
+</div>
+
+<div id="appView">
+  <div class="card row" style="align-items:center; justify-content:space-between;">
+    <span id="statePill" class="pill state-idle"><span class="dot"></span><span id="stateText">idle</span></span>
+    <span class="pill" id="brainPill">brain: —</span>
+  </div>
+
+  <div id="permBanner">
+    <div id="permQuestion" style="margin-bottom:10px;"></div>
+    <div class="row">
+      <button class="yes" onclick="sendMessage('yes')">Yes</button>
+      <button class="no" onclick="sendMessage('no')">No</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row" style="margin-bottom:10px;">
+      <button onclick="sendMessage('switch to qwen')">Qwen3</button>
+      <button onclick="sendMessage('switch to deep reasoning')">DeepSeek</button>
+      <button onclick="sendMessage('switch to claude')">Claude</button>
+      <button onclick="sendMessage('switch to gemini')">Gemini</button>
+    </div>
+    <div id="transcript"></div>
+  </div>
+
+  <div class="card">
+    <div class="row" style="margin-bottom:8px;">
+      <input id="msgBox" type="text" placeholder="Type a message…">
+      <button onclick="sendTyped()">Send</button>
+    </div>
+    <div id="micStatus" class="hint mono" style="display:none; color: var(--green); font-weight:600;"></div>
+    <div class="row" style="margin-bottom:8px; gap:8px;">
+      <button id="micEnableBtn">Enable phone microphone</button>
+      <button id="micDisableBtn" style="display:none;">Disable microphone</button>
+    </div>
+    <button id="micBtn" style="touch-action: none;">Hold to talk</button>
+    <div class="row" style="margin-top:8px; align-items:center; gap:6px;">
+      <label for="volCtl" style="font-size:12px; min-width:52px;">Volume</label>
+      <input id="volCtl" type="range" min="0" max="2.5" step="0.1" value="1.5" style="flex:1;">
+      <label for="speedCtl" style="font-size:12px; min-width:46px; margin-left:8px;">Speed</label>
+      <input id="speedCtl" type="range" min="0.8" max="1.6" step="0.02" value="1.12" style="flex:1;">
+    </div>
+    <div class="row" style="margin-top:8px;">
+      <button id="micTestBtn">Test phone audio</button>
+    </div>
+    <div id="voiceUnavailable" class="hint" style="display:none;">
+      Voice input needs a secure connection (HTTPS) — phones block
+      microphone access on any plain http:// page except localhost.
+      This app is served over HTTPS, so this normally shouldn't appear;
+      if it does, something's misconfigured — text still works fully.
+    </div>
+    <div id="voiceErr" class="err"></div>
+    <div id="voiceDebug" class="hint mono" style="display:none; white-space:pre-wrap;"></div>
+  </div>
+</div>
+
+<audio id="player" style="display:none;"></audio>
+
+<script>
+const TOKEN_KEY = "jarvis_phone_token";
+let token = localStorage.getItem(TOKEN_KEY);
+
+function api(path, opts) {
+  opts = opts || {};
+  opts.headers = Object.assign({}, opts.headers, token ? {"Authorization": "Bearer " + token} : {});
+  return fetch(path, opts);
+}
+
+// Live-filter the pairing code as it's typed: uppercase, and strip
+// anything outside the server's own alphabet (A-Z minus I/O, 2-9 minus
+// 0/1 -- see phone_auth._CODE_ALPHABET). This is the real fix for the
+// 2026-09-29 field failure: a mobile keyboard's autocorrect/predictive-
+// text (Samsung Keyboard confirmed) can silently insert a space or
+// alter a character after it's typed but before submit -- filtering on
+// every keystroke means whatever's IN THE FIELD is always exactly what
+// gets submitted, with no gap for autocorrect to sneak something in
+// unnoticed. autocorrect="off"/spellcheck="false" on the input (see
+// the HTML) reduce how often the keyboard tries in the first place;
+// this filter is the backstop for when it tries anyway.
+const CODE_CHARS = /[^A-HJ-NP-Z2-9]/g;
+
+function normalizeCodeField() {
+  const el = document.getElementById("pairCode");
+  const cleaned = el.value.toUpperCase().replace(CODE_CHARS, "").slice(0, 8);
+  if (cleaned !== el.value) el.value = cleaned;
+  return cleaned;
+}
+
+async function doPair() {
+  const code = normalizeCodeField();
+  const label = document.getElementById("pairLabel").value.trim() || (navigator.userAgent.includes("iPhone") ? "iPhone" : "Phone");
+  const errEl = document.getElementById("pairErr");
+  errEl.textContent = "";
+  if (!code) { errEl.textContent = "Enter the code from the desktop first."; return; }
+  try {
+    const r = await fetch("/pair/redeem", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({code, label})
+    });
+    if (r.status === 429) {
+      errEl.textContent = "Too many attempts from this device -- wait a "
+        + "few minutes before trying again. (No need to keep tapping "
+        + "Pair; that only extends the wait.)";
+      return;
+    }
+    if (!r.ok) {
+      // clear the rejected code so a retry can never silently resubmit
+      // the exact same (wrong or stale) value -- never auto-resubmit
+      document.getElementById("pairCode").value = "";
+      const j = await r.json().catch(() => ({}));
+      errEl.textContent = "Wrong or expired code (" + (j.detail || "rejected")
+        + "). Get a fresh one by saying or typing \"pair a phone\" on the "
+        + "desktop, then re-type it carefully -- watch for autocorrect.";
+      return;
+    }
+    const j = await r.json();
+    token = j.token;
+    localStorage.setItem(TOKEN_KEY, token);
+    showApp();
+  } catch (e) { errEl.textContent = "network error: " + e; }
+}
+
+function showApp() {
+  document.getElementById("pairView").style.display = "none";
+  document.getElementById("appView").style.display = "block";
+  applyMicAvailability();
+  // warmMicEnabled is never persisted/resumed across a page load (see
+  // its declaration below) -- always starts false here, so this always
+  // reflects "not enabled yet" on a fresh showApp(), including the
+  // very first paint and every reload.
+  updateMicStatusUI();
+  loadPlaybackPrefs();
+  connectEvents();
+}
+
+// 2026-09-21 field defect, diagnosed: replies stayed quiet on the
+// S23 Ultra even after server-side WAV normalization. Root cause was
+// TWO separate ceilings, not one:
+//   1. phone_bridge.py's OLD gain stage was pure PEAK normalization
+//      (scale the single loudest sample up to a target) -- which does
+//      NOT equal perceived loudness. Ordinary speech has brief loud
+//      transients (consonant bursts) sitting well above its sustained
+//      vowel-and-breath level; a clip can hit its target PEAK while
+//      still sounding quiet overall, because the peak-normalizer only
+//      ever looked at the one loudest sample, not the average level a
+//      human ear actually judges as "loud." Fixed server-side by
+//      switching to RMS (average-level) target normalization with a
+//      peak LIMIT as the clip-safety ceiling, not the loudness target
+//      -- see phone_bridge.py's _normalize_gain and PHONE_TARGET_RMS.
+//   2. HTMLMediaElement.volume is spec-capped at 1.0 -- "full volume,"
+//      never a boost. Even a perfectly loudness-normalized WAV can
+//      still be quieter than Captain wants in a noisy room, and the
+//      OLD volume slider had no way to go past what the file itself
+//      already contained. Fixed here: the shared <audio> element is
+//      routed through a real WebAudio graph (GainNode, which CAN
+//      exceed 1.0) with a DynamicsCompressorNode configured as a hard
+//      limiter right after it, so a boosted gain can raise the
+//      perceived level without ever clipping/distorting the output.
+//      Falls back to plain player.volume (capped at 1, same as
+//      before) if WebAudio is unavailable in this browser -- audio
+//      must never go silent just because the boost path failed.
+//
+// Speed defaults to 1.12x (phone_bridge.PHONE_DEFAULT_PLAYBACK_RATE)
+// -- desktop's sounddevice output in mouth.py is a completely separate
+// code path and is never touched by this file. Both prefs persist
+// across visits via localStorage, same pattern as the pairing token.
+const VOL_KEY = "jarvis_phone_volume";
+const SPEED_KEY = "jarvis_phone_speed";
+const DEFAULT_PLAYBACK_RATE = 1.12;
+const DEFAULT_VOLUME_GAIN = 1.5;   // 150% -- a real boost, not just "full"
+
+let audioGraphCtx = null, gainNode = null, limiterNode = null,
+    mediaSourceNode = null, audioGraphReady = false, audioGraphFailed = false;
+
+// Lazily builds the gain/limiter graph around the shared <audio>
+// element -- idempotent (a no-op after the first successful call), and
+// deliberately NOT built eagerly at page load, since
+// createMediaElementSource requires the element to exist and browsers
+// prefer AudioContext creation to happen close to a real user gesture
+// (a Hold-to-talk press, "Test phone audio", pairing) rather than on
+// page load. Once built, player.volume is fixed at 1 -- gainNode.gain
+// becomes the ONE real volume control, and can go above 1.0.
+function ensureAudioGraph() {
+  if (audioGraphReady || audioGraphFailed) return;
+  try {
+    const player = document.getElementById("player");
+    audioGraphCtx = new (window.AudioContext || window.webkitAudioContext)();
+    mediaSourceNode = audioGraphCtx.createMediaElementSource(player);
+    gainNode = audioGraphCtx.createGain();
+    limiterNode = audioGraphCtx.createDynamicsCompressor();
+    // A LIMITER, not a musical compressor: high ratio, fast attack/
+    // release, low threshold -- so a boosted gain (up to 2.5x on the
+    // slider) can never clip or distort the output no matter how hot
+    // the already-normalized WAV coming in is.
+    limiterNode.threshold.value = -6;    // dB
+    limiterNode.knee.value = 0;
+    limiterNode.ratio.value = 20;
+    limiterNode.attack.value = 0.003;
+    limiterNode.release.value = 0.15;
+    mediaSourceNode.connect(gainNode);
+    gainNode.connect(limiterNode);
+    limiterNode.connect(audioGraphCtx.destination);
+    player.volume = 1;
+    audioGraphReady = true;
+    applyPlaybackPrefs();
+  } catch (e) {
+    console.log("WebAudio gain graph unavailable, falling back to plain volume:", e);
+    audioGraphFailed = true;
+  }
+}
+
+async function _resumeAudioGraph() {
+  ensureAudioGraph();
+  if (audioGraphReady) {
+    try { await audioGraphCtx.resume(); } catch (e) {}
+  }
+}
+
+function loadPlaybackPrefs() {
+  const savedVol = parseFloat(localStorage.getItem(VOL_KEY));
+  const savedSpeed = parseFloat(localStorage.getItem(SPEED_KEY));
+  document.getElementById("volCtl").value = Number.isFinite(savedVol) ? savedVol : DEFAULT_VOLUME_GAIN;
+  document.getElementById("speedCtl").value = Number.isFinite(savedSpeed) ? savedSpeed : DEFAULT_PLAYBACK_RATE;
+  applyPlaybackPrefs();
+}
+
+function applyPlaybackPrefs() {
+  const vol = parseFloat(document.getElementById("volCtl").value);
+  const speed = parseFloat(document.getElementById("speedCtl").value);
+  const player = document.getElementById("player");
+  if (audioGraphReady && gainNode) {
+    gainNode.gain.value = vol;
+    player.volume = 1;
+  } else {
+    // No graph yet (built lazily on first playback attempt) or
+    // unavailable in this browser -- native volume, capped at 1 by
+    // spec, same behavior this app had before the boost path existed.
+    player.volume = Math.min(1, vol);
+  }
+  player.playbackRate = speed;
+  localStorage.setItem(VOL_KEY, String(vol));
+  localStorage.setItem(SPEED_KEY, String(speed));
+}
+
+document.getElementById("volCtl").addEventListener("input", applyPlaybackPrefs);
+document.getElementById("speedCtl").addEventListener("input", applyPlaybackPrefs);
+
+// "Add a short Test phone audio control and test tone/phrase for
+// calibration." /speak/test.wav (phone_bridge.py) runs the EXACT same
+// synthesis + gain pipeline a real reply uses, so what's heard here is
+// what a real reply will actually sound like -- not an abstract tone
+// that might calibrate to the wrong thing.
+async function testPhoneAudio() {
+  await _resumeAudioGraph();
+  const player = document.getElementById("player");
+  player.onended = null;
+  player.onerror = null;
+  applyPlaybackPrefs();
+  player.src = "/speak/test.wav?token=" + encodeURIComponent(token);
+  player.play().catch(e => console.log("test playback blocked:", e));
+}
+document.getElementById("micTestBtn").addEventListener("click", testPhoneAudio);
+
+// 2026-09-21: "the instant I press Hold to talk, Jarvis must
+// immediately stop any current speech on both phone and desktop."
+// stopAllPlayback is the PHONE half -- purely local, zero network
+// round trip, so it's instant regardless of connection quality: clear
+// the autoplay queue so nothing already-queued starts later, detach
+// the onended/onerror handlers so a straggling event from the OLD
+// playback can't re-trigger anything, then hard-stop and unload the
+// shared <audio> element (removing src + calling load() aborts
+// whatever fetch/decode was in flight for it, per the HTMLMediaElement
+// spec). sendInterrupt is the DESKTOP half -- see phone_bridge.py's
+// /interrupt endpoint and main.py's _phone_interrupt.
+function stopAllPlayback() {
+  autoplayQueue = [];
+  autoplayBusy = false;
+  const player = document.getElementById("player");
+  player.onended = null;
+  player.onerror = null;
+  try { player.pause(); } catch (e) {}
+  player.removeAttribute("src");
+  try { player.load(); } catch (e) {}
+}
+
+function sendInterrupt() {
+  return api("/interrupt", {method: "POST"}).catch(e => {
+    debugLog("interrupt request failed (continuing anyway): " + e);
+  });
+}
+
+function showPair() {
+  document.getElementById("appView").style.display = "none";
+  document.getElementById("pairView").style.display = "block";
+  // never carry a stale/previous code into a fresh pairing attempt --
+  // the field starts empty every time this view is shown, whether
+  // that's the first page load or a bounce-back after a 401 elsewhere.
+  document.getElementById("pairCode").value = "";
+  document.getElementById("pairErr").textContent = "";
+  // 2026-09-21: showPair() is the one place every "this device is no
+  // longer authorized" path already converges on (an explicit 401 from
+  // /message, and now /voice too -- see stopRecording) -- stopping the
+  // mic here covers "pairing revocation" without needing a separate
+  // signal for it. Safe to call even if the mic was never enabled.
+  disableWarmMic();
+}
+
+function addLine(who, text, id) {
+  const t = document.getElementById("transcript");
+  const div = document.createElement("div");
+  const isJarvis = who.startsWith("jarvis");
+  div.className = "line " + (isJarvis ? "jarvis" : "captain");
+  const playBtn = isJarvis && id
+    ? `<button style="margin-top:6px;padding:4px 10px;font-size:12px;" onclick="playTurn(${id})">▶ play</button>`
+    : "";
+  div.innerHTML = `<div class="who">${who}</div><div>${text.replace(/</g, "&lt;")}</div>${playBtn}`;
+  t.appendChild(div);
+  t.scrollTop = t.scrollHeight;
+}
+
+function speakUrl(id, chunk) {
+  return "/speak/" + id + "/" + chunk + ".wav?token=" + encodeURIComponent(token);
+}
+
+// 2026-09-21: "phone replies should start faster." /speak/{id}.wav
+// used to block until Jarvis's WHOLE reply had synthesized before
+// sending a single byte back. phone_bridge.py now exposes each
+// sentence as its own small, complete, ordinary WAV file at
+// /speak/{id}/{chunk}.wav (see the server's per-chunk endpoint) --
+// this plays them back-to-back on the shared <audio> element,
+// starting sentence 0 the moment IT is ready rather than waiting for
+// the whole reply. A chunk index past the end of the reply 404s,
+// which is the normal, expected stop condition (not an error).
+async function playChunksSequentially(id, onDone) {
+  await _resumeAudioGraph();
+  const player = document.getElementById("player");
+  let chunk = 0;
+  const playNext = () => {
+    player.onended = playNext;
+    player.onerror = onDone;
+    applyPlaybackPrefs();
+    player.src = speakUrl(id, chunk);
+    chunk += 1;
+    player.play().catch(e => { console.log("playback blocked:", e); onDone(); });
+  };
+  playNext();
+}
+
+function playTurn(id) {
+  playChunksSequentially(id, () => {});
+}
+
+// Sequential auto-play queue for Jarvis's replies: each reply arrives
+// as exactly ONE complete transcript line (see phone_bridge.
+// finalize_jarvis_turn), and this plays it automatically -- but two
+// replies could in principle land in the same SSE tick, so this plays
+// them ONE AT A TIME (and, within a reply, one SENTENCE at a time via
+// playChunksSequentially above) off the SAME shared <audio> element,
+// never two overlapping. The manual ▶ button on each line (addLine)
+// stays as a fallback if the browser's autoplay policy blocks this
+// (some mobile browsers require a fresh user gesture per playback
+// attempt).
+let autoplayQueue = [];
+let autoplayBusy = false;
+
+function queueAutoplay(id) {
+  autoplayQueue.push(id);
+  pumpAutoplayQueue();
+}
+
+function pumpAutoplayQueue() {
+  if (autoplayBusy || autoplayQueue.length === 0) return;
+  autoplayBusy = true;
+  const id = autoplayQueue.shift();
+  const advance = () => { autoplayBusy = false; pumpAutoplayQueue(); };
+  playChunksSequentially(id, advance);
+}
+
+async function sendTyped() {
+  const box = document.getElementById("msgBox");
+  const text = box.value.trim();
+  if (!text) return;
+  box.value = "";
+  await sendMessage(text);
+}
+
+async function sendMessage(text) {
+  const r = await api("/message", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({text})
+  });
+  if (r.status === 401) { localStorage.removeItem(TOKEN_KEY); token = null; showPair(); }
+}
+
+let es = null;
+function connectEvents() {
+  if (es) es.close();
+  es = new EventSource("/events?token=" + encodeURIComponent(token));
+  es.onmessage = (ev) => {
+    const d = JSON.parse(ev.data);
+    const pill = document.getElementById("statePill");
+    pill.className = "pill state-" + (d.state || "idle");
+    document.getElementById("stateText").textContent = d.state || "idle";
+    document.getElementById("brainPill").textContent = "brain: " + d.active_brain;
+    const banner = document.getElementById("permBanner");
+    if (d.pending_permission) {
+      banner.style.display = "block";
+      document.getElementById("permQuestion").textContent = d.pending_permission.question;
+    } else {
+      banner.style.display = "none";
+    }
+    (d.new_lines || []).forEach(l => {
+      addLine(l.who, l.text, l.id);
+      if (l.who.startsWith("jarvis")) queueAutoplay(l.id);
+    });
+  };
+  es.onerror = () => {
+    // EventSource auto-reconnects on its own -- but "the live
+    // connection to the phone bridge just failed" (a dropped
+    // connection, a revoked token, the desktop process restarting) is
+    // exactly the kind of uncertainty that should stop a warm mic
+    // rather than leave it running silently in the background while
+    // we can't confirm anything about the session's state. Requires
+    // tapping "Enable phone microphone" again once reconnected.
+    disableWarmMic();
+  };
+}
+
+// ---- voice: hold-to-record, native-rate capture resampled to 16kHz
+// mono PCM ourselves, WAV-wrapped, POST /voice ----
+//
+// 2026-09-29 field defect: real-device transcripts came back badly
+// clipped/mangled. Root causes found and fixed here:
+//   1. Forcing `new AudioContext({sampleRate: 16000})` makes the
+//      BROWSER resample internally from the hardware's native rate
+//      (commonly 48000 on Android) down to 16000 -- quality of that
+//      internal resampler is opaque and implementation-dependent, and
+//      it still self-reports sampleRate===16000 either way, so the
+//      server's strict rate check can't catch a bad one. Fixed by
+//      capturing at whatever rate the device actually uses natively,
+//      and doing the downsample ourselves (resampleTo16k below), with
+//      a real anti-aliasing low-pass filter first so decimating from
+//      (e.g.) 48000->16000 doesn't fold high-frequency content back
+//      into the audible band as noise.
+//   2. On release, disconnecting the processor and closing the
+//      AudioContext immediately can drop the LAST partial buffer (up
+//      to one bufferSize's worth, ~0.25s) that was still in flight --
+//      clipping the tail end of the last word. Fixed with a short
+//      drain pause before tearing anything down.
+let audioCtx = null, micStream = null, processor = null, recording = false;
+let liveSamples = [], recordStartedAt = 0;
+// 2026-09-21 field defect #1 fix, then a privacy correction the same
+// day: keeping the mic stream open between presses (so the first
+// syllable of a press isn't lost -- see preRollChunks/pushPreRoll
+// below) must never happen automatically. warmMicEnabled is the
+// explicit, session-only opt-in -- true ONLY after a deliberate tap on
+// "Enable phone microphone" (enableWarmMic), ALWAYS false again on a
+// fresh page load no matter what was chosen last time (never read
+// from localStorage), and flipped back to false the moment anything
+// uncertain happens: page hidden/backgrounded/locked, the phone
+// bridge connection drops, or the device is no longer authorized (see
+// disableWarmMic and its call sites: visibilitychange, pagehide,
+// es.onerror, showPair). Without it, Hold to talk still works exactly
+// as it always did -- a cold, one-shot mic open-record-close per
+// press, no pre-roll, mic closed the rest of the time -- which is the
+// deliberate fallback for anyone who never opts in.
+let warmMicEnabled = false;
+let warmActive = false;
+let preRollChunks = [], preRollSampleCount = 0;
+const PRE_ROLL_MS = 600;
+const MIC_READY_TEXT = "MIC READY — last 600 ms held locally; "
+  + "nothing uploads until Hold to talk.";
+// A fresh id per press, sent as X-Capture-Session on /voice (see
+// phone_bridge.py's dedup check) -- defense in depth alongside the
+// Pointer Events migration below against a duplicate submission of
+// the same recording ("sometimes duplicates the same phrase").
+let captureSession = null;
+let interruptPromise = null;
+// Mirrors phone_bridge.VOICE_SILENCE_RMS (same int16-scale threshold)
+// so an obviously-dead-air press never even uploads: saves the round
+// trip and is a second, independent layer against Whisper's near-
+// silence hallucinations ("You" reaching Jarvis on empty input).
+const CLIENT_SILENCE_RMS = 80;
+
+function pushPreRoll(chunk, rate) {
+  preRollChunks.push(chunk);
+  preRollSampleCount += chunk.length;
+  const capSamples = Math.ceil(rate * PRE_ROLL_MS / 1000);
+  while (preRollChunks.length > 1 && preRollSampleCount - preRollChunks[0].length >= capSamples) {
+    preRollSampleCount -= preRollChunks.shift().length;
+  }
+  if (preRollSampleCount > capSamples && preRollChunks.length) {
+    const over = preRollSampleCount - capSamples;
+    preRollChunks[0] = preRollChunks[0].subarray(over);
+    preRollSampleCount -= over;
+  }
+}
+
+const DEBUG_MODE = new URLSearchParams(location.search).get("debug") === "1";
+
+function debugLog(msg) {
+  if (!DEBUG_MODE) return;
+  const el = document.getElementById("voiceDebug");
+  el.style.display = "block";
+  el.textContent = msg;
+}
+
+// Cascaded single-pole low-pass (3 passes -- a cheap, standard anti-
+// alias technique: cascading identical simple filters multiplies their
+// attenuation, approximating a steeper rolloff without real DSP
+// complexity or an external library) then linear-interpolation
+// decimation. No-op if already at 16000 (some browsers DO honor the
+// native rate as exactly 16000, e.g. certain desktop Chrome builds --
+// this only resamples when it actually needs to).
+//
+// Numerically verified (not just eyeballed) against synthetic test
+// tones before shipping: a single pass at this cutoff only attenuated
+// a 20kHz tone by ~9dB -- not enough to prevent it folding audibly
+// into the 0-8kHz band once decimated. 3 passes gets that to ~28dB
+// while costing speech-range content (1-5kHz) under 4dB, a reasonable
+// trade for a cheap filter with no real DSP library involved.
+function _lowpassPass(x, alpha) {
+  const y = new Float32Array(x.length);
+  let prev = x.length ? x[0] : 0;
+  y[0] = prev;
+  for (let i = 1; i < x.length; i++) {
+    prev = prev + alpha * (x[i] - prev);
+    y[i] = prev;
+  }
+  return y;
+}
+
+function resampleTo16k(float32, srcRate) {
+  if (srcRate === 16000) return float32;
+  const cutoff = 7500;   // just under the new Nyquist (8000) for margin
+  const passes = 3;
+  const dt = 1 / srcRate;
+  const rc = 1 / (2 * Math.PI * cutoff);
+  const alpha = dt / (rc + dt);
+  let filtered = float32;
+  for (let p = 0; p < passes; p++) filtered = _lowpassPass(filtered, alpha);
+  const ratio = srcRate / 16000;
+  const outLen = Math.max(0, Math.floor(filtered.length / ratio));
+  const out = new Float32Array(outLen);
+  for (let i = 0; i < outLen; i++) {
+    const srcPos = i * ratio;
+    const idx = Math.floor(srcPos);
+    const frac = srcPos - idx;
+    const a = filtered[idx] ?? 0;
+    const b = filtered[idx + 1] ?? a;
+    out[i] = a + (b - a) * frac;
+  }
+  return out;
+}
+
+function floatTo16(buf) {
+  const out = new Int16Array(buf.length);
+  for (let i = 0; i < buf.length; i++) {
+    let s = Math.max(-1, Math.min(1, buf[i]));
+    out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  }
+  return out;
+}
+
+function encodeWav(int16, rate) {
+  const buf = new ArrayBuffer(44 + int16.length * 2);
+  const v = new DataView(buf);
+  const writeStr = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  writeStr(0, "RIFF"); v.setUint32(4, 36 + int16.length * 2, true);
+  writeStr(8, "WAVE"); writeStr(12, "fmt "); v.setUint32(16, 16, true);
+  v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true);
+  v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  writeStr(36, "data"); v.setUint32(40, int16.length * 2, true);
+  for (let i = 0; i < int16.length; i++) v.setInt16(44 + i * 2, int16[i], true);
+  return new Blob([buf], {type: "audio/wav"});
+}
+
+// This app is always served over HTTPS now (Tailscale mode, the only
+// mode -- see phone_bridge.py), so this should normally read true.
+// Kept as an honest, defensive check rather than an assumption: phones
+// block microphone access on any non-secure origin, and if this page
+// somehow got reached over plain HTTP (a misconfiguration, a stray
+// bookmark to the old bootstrap page, ...) the button disables itself
+// instead of silently failing the moment someone holds it down.
+function micAvailable() {
+  return window.isSecureContext && !!(navigator.mediaDevices
+    && navigator.mediaDevices.getUserMedia);
+}
+
+function applyMicAvailability() {
+  const btn = document.getElementById("micBtn");
+  const enableBtn = document.getElementById("micEnableBtn");
+  const hint = document.getElementById("voiceUnavailable");
+  if (!micAvailable()) {
+    btn.disabled = true;
+    btn.textContent = "Voice unavailable (needs HTTPS)";
+    enableBtn.disabled = true;
+    hint.style.display = "block";
+  } else {
+    btn.disabled = false;
+    enableBtn.disabled = false;
+    hint.style.display = "none";
+  }
+}
+
+// Opens a mic stream + AudioContext and wires the shared processing
+// callback. Used by BOTH paths: enableWarmMic (left running, feeds the
+// pre-roll ring buffer between presses) and a cold one-shot
+// startRecording press when warm mode was never enabled (opened and
+// closed around that single press, exactly like this app worked
+// before pre-roll existed -- no ring buffer, mic closed the rest of
+// the time). The ScriptProcessor stays connected to the destination
+// purely so onaudioprocess keeps firing (a standard, long-known
+// requirement in some browser implementations) -- its output buffer
+// is never written to, so nothing is actually played back (no
+// feedback/echo).
+async function _openMicStream() {
+  micStream = await navigator.mediaDevices.getUserMedia({audio: {channelCount: 1}});
+  // No forced sampleRate here on purpose -- see the block comment
+  // above resampleTo16k for why. Whatever the device's native rate
+  // is, we capture it faithfully and resample ourselves on release.
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const src = audioCtx.createMediaStreamSource(micStream);
+  processor = audioCtx.createScriptProcessor(4096, 1, 1);
+  preRollChunks = [];
+  preRollSampleCount = 0;
+  processor.onaudioprocess = (e) => {
+    const chunk = new Float32Array(e.inputBuffer.getChannelData(0));
+    if (recording) {
+      liveSamples.push(chunk);
+    } else if (warmMicEnabled) {
+      // Only ever buffered while warm mode is an explicit, current
+      // opt-in -- never held quietly in the background otherwise.
+      pushPreRoll(chunk, audioCtx.sampleRate);
+    }
+  };
+  src.connect(processor);
+  processor.connect(audioCtx.destination);
+  warmActive = true;
+}
+
+// Stops the track and releases everything -- 2026-09-21 privacy
+// requirement: "clear the pre-roll buffer and stop the microphone
+// track on Disable, page hide, app backgrounding, device lock, pairing
+// revocation, and phone bridge disconnect." A plain function
+// declaration (hoisted), not a const arrow, so every call site above
+// this point in the file (showPair, es.onerror) can reference it
+// regardless of source order.
+async function _closeMicStream() {
+  try { processor && processor.disconnect(); } catch (e) {}
+  try { micStream && micStream.getTracks().forEach(t => t.stop()); } catch (e) {}
+  try { audioCtx && await audioCtx.close(); } catch (e) {}
+  processor = null;
+  micStream = null;
+  audioCtx = null;
+  preRollChunks = [];
+  preRollSampleCount = 0;
+  warmActive = false;
+}
+
+function updateMicStatusUI() {
+  const statusEl = document.getElementById("micStatus");
+  const enableBtn = document.getElementById("micEnableBtn");
+  const disableBtn = document.getElementById("micDisableBtn");
+  if (warmMicEnabled) {
+    statusEl.textContent = MIC_READY_TEXT;
+    statusEl.style.display = "block";
+    enableBtn.style.display = "none";
+    disableBtn.style.display = "inline-block";
+  } else {
+    statusEl.style.display = "none";
+    enableBtn.style.display = "inline-block";
+    disableBtn.style.display = "none";
+  }
+}
+
+// The ONLY path that turns warm mode (and its pre-roll ring buffer)
+// on -- a deliberate tap on "Enable phone microphone". Never called
+// automatically: not on page load, not from startRecording, not
+// resumed from a previous visit (warmMicEnabled always starts false).
+async function enableWarmMic() {
+  if (warmMicEnabled) return;
+  if (!micAvailable()) return;
+  const errEl = document.getElementById("voiceErr");
+  errEl.textContent = "";
+  try {
+    await _openMicStream();
+    warmMicEnabled = true;
+    updateMicStatusUI();
+    debugLog(`mic warm-enabled | native rate: ${audioCtx.sampleRate}Hz`);
+  } catch (e) {
+    errEl.textContent = "mic error: " + e;
+  }
+}
+
+async function disableWarmMic() {
+  if (!warmMicEnabled && !warmActive) { updateMicStatusUI(); return; }
+  warmMicEnabled = false;
+  await _closeMicStream();
+  updateMicStatusUI();
+  debugLog("mic disabled -- pre-roll cleared, track stopped");
+}
+
+async function startRecording() {
+  if (recording) return;   // Pointer Events below + this guard = exactly one capture per press
+  if (!micAvailable()) return;
+  const errEl = document.getElementById("voiceErr");
+  errEl.textContent = "";
+  if (!warmMicEnabled) {
+    // Cold path: no "Enable phone microphone" opt-in yet, so no
+    // pre-roll and no standing stream -- open fresh for exactly this
+    // press, same as this app's original hold-to-talk behavior before
+    // pre-roll existed. The mic closes again in stopRecording.
+    try {
+      await _openMicStream();
+    } catch (e) {
+      errEl.textContent = "mic error: " + e;
+      return;
+    }
+  }
+  // "The instant I press Hold to talk, Jarvis must immediately stop
+  // any current speech on both phone and desktop, then listen to and
+  // answer only my newest query." stopAllPlayback is instant (purely
+  // local); sendInterrupt fires the network request but is only
+  // AWAITED later, at release time (see stopRecording) -- so it can
+  // never delay when recording actually starts capturing.
+  stopAllPlayback();
+  interruptPromise = sendInterrupt();
+  captureSession = (window.crypto && crypto.randomUUID)
+    ? crypto.randomUUID() : (Date.now() + "-" + Math.random());
+  // Splice the pre-roll buffer onto the front of this capture -- the
+  // fix for "phone speech misses the beginning of sentences." Empty
+  // (no-op splice) on the cold path, since there's nothing buffered
+  // yet without warm mode enabled.
+  liveSamples = preRollChunks.slice();
+  recording = true;
+  recordStartedAt = performance.now();
+  document.getElementById("micBtn").classList.add("recording");
+  document.getElementById("micBtn").textContent = "Recording… release to send";
+  debugLog(`native rate: ${audioCtx.sampleRate}Hz | recording `
+    + `(${preRollChunks.length} pre-roll chunk(s) spliced in)...`);
+}
+
+async function stopRecording() {
+  if (!recording) return;
+  recording = false;
+  document.getElementById("micBtn").classList.remove("recording");
+  document.getElementById("micBtn").textContent = "Hold to talk";
+  // The stream can be torn out from under an in-progress recording by
+  // a privacy trigger firing mid-press (page hidden/backgrounded/
+  // locked, or a disconnect) -- nothing safe is left to capture in
+  // that case, so discard rather than touching a null audioCtx below.
+  if (!audioCtx || !micStream) {
+    liveSamples = [];
+    debugLog("recording interrupted: mic stream closed mid-press -- discarded");
+    return;
+  }
+  const heldMs = Math.round(performance.now() - recordStartedAt);
+  // Let any ALREADY-IN-FLIGHT onaudioprocess callback land before we
+  // snapshot liveSamples -- fixes the clipped-tail defect. The stream
+  // stays open only if warm mode is enabled; otherwise it's closed
+  // below, right after this drain.
+  await new Promise(r => setTimeout(r, 80));
+  const srcRate = audioCtx.sampleRate;
+  const captured = liveSamples;
+  liveSamples = [];
+  const total = captured.reduce((n, a) => n + a.length, 0);
+  const flat = new Float32Array(total);
+  let off = 0;
+  for (const a of captured) { flat.set(a, off); off += a.length; }
+  const errEl = document.getElementById("voiceErr");
+  const session = captureSession;
+  const closeIfCold = async () => { if (!warmMicEnabled) await _closeMicStream(); };
+  if (total === 0) {
+    debugLog(`native rate: ${srcRate}Hz | held ${heldMs}ms | 0 samples captured`);
+    await closeIfCold();
+    return;
+  }
+  let sumSq = 0;
+  for (let i = 0; i < flat.length; i++) sumSq += flat[i] * flat[i];
+  const rms16 = Math.sqrt(sumSq / flat.length) * 32767;
+  if (rms16 < CLIENT_SILENCE_RMS) {
+    debugLog(`native rate: ${srcRate}Hz | held ${heldMs}ms | rms=${rms16.toFixed(0)} `
+      + `below silence floor (${CLIENT_SILENCE_RMS}) -- not uploaded`);
+    await closeIfCold();
+    return;
+  }
+  const resampled = resampleTo16k(flat, srcRate);
+  const wav = encodeWav(floatTo16(resampled), 16000);
+  debugLog(`native rate: ${srcRate}Hz -> 16000Hz | held ${heldMs}ms | `
+    + `${flat.length} samples captured -> ${resampled.length} resampled | `
+    + `rms=${rms16.toFixed(0)} | session=${session} | ${wav.size} byte WAV | uploading...`);
+  try {
+    if (interruptPromise) await interruptPromise;
+    const r = await api("/voice", {
+      method: "POST",
+      headers: {"Content-Type": "audio/wav", "X-Capture-Session": session},
+      body: wav
+    });
+    if (r.status === 401) {
+      // Device no longer authorized (revoked, or a stale token) --
+      // showPair() itself stops the mic; see its own comment.
+      localStorage.removeItem(TOKEN_KEY);
+      token = null;
+      showPair();
+      return;
+    }
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      errEl.textContent = j.detail || ("error " + r.status);
+      debugLog(`native rate: ${srcRate}Hz -> 16000Hz | held ${heldMs}ms | `
+        + `${wav.size} byte WAV | REJECTED: ${j.detail || r.status}`);
+    } else if (j.duplicate) {
+      debugLog(`session ${session}: duplicate submission -- server ignored it`);
+    } else {
+      if (j.text === "") errEl.textContent = "(heard silence)";
+      debugLog(`native rate: ${srcRate}Hz -> 16000Hz | held ${heldMs}ms | `
+        + `${wav.size} byte WAV | Whisper heard (raw transcript): "${j.text}"`);
+    }
+  } catch (e) {
+    errEl.textContent = "upload error: " + e;
+    debugLog(`upload error: ${e}`);
+  } finally {
+    await closeIfCold();
+  }
+}
+
+// 2026-09-21: touchstart/touchend/mousedown/mouseup (the old listener
+// set) is the classic setup for a duplicate-submission bug -- mobile
+// browsers fire a SYNTHETIC mousedown/mouseup after a real touch
+// sequence on many elements, which used to mean startRecording()/
+// stopRecording() each ran twice per press ("sometimes duplicates the
+// same phrase"). Pointer Events unify both into one event stream per
+// physical pointer, and setPointerCapture below guarantees this exact
+// pointer's up/cancel events keep routing here even if a thumb slides
+// off the button before lifting.
+const micBtn = document.getElementById("micBtn");
+micBtn.addEventListener("pointerdown", (e) => {
+  e.preventDefault();
+  try { micBtn.setPointerCapture(e.pointerId); } catch (err) {}
+  startRecording();
+});
+micBtn.addEventListener("pointerup", (e) => { e.preventDefault(); stopRecording(); });
+micBtn.addEventListener("pointercancel", (e) => { e.preventDefault(); stopRecording(); });
+micBtn.addEventListener("pointerleave", (e) => {
+  if (recording && !(micBtn.hasPointerCapture && micBtn.hasPointerCapture(e.pointerId))) {
+    stopRecording();
+  }
+});
+document.getElementById("micEnableBtn").addEventListener("click", enableWarmMic);
+document.getElementById("micDisableBtn").addEventListener("click", disableWarmMic);
+
+// 2026-09-21 privacy requirement: stop the mic the moment the page is
+// no longer the thing in front of the user -- backgrounding the tab,
+// locking the phone, or switching apps all surface as the SAME signal
+// on mobile browsers (visibilitychange -> "hidden"), so one handler
+// covers all three. pagehide is the belt-and-suspenders backstop for
+// an actual navigation/close, where visibilitychange isn't guaranteed
+// to fire first on every engine; it does its teardown synchronously
+// (no awaiting async work) since a page being torn down offers no
+// guarantee an async continuation ever runs.
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden" && (warmMicEnabled || warmActive)) {
+    disableWarmMic();
+  }
+});
+window.addEventListener("pagehide", () => {
+  if (warmMicEnabled || warmActive) {
+    warmMicEnabled = false;
+    warmActive = false;
+    preRollChunks = [];
+    preRollSampleCount = 0;
+    try { micStream && micStream.getTracks().forEach(t => t.stop()); } catch (e) {}
+  }
+});
+document.getElementById("pairBtn").addEventListener("click", doPair);
+document.getElementById("pairCode").addEventListener("input", normalizeCodeField);
+document.getElementById("msgBox").addEventListener("keydown", (e) => { if (e.key === "Enter") sendTyped(); });
+
+// ---- boot ----
+if (token) showApp(); else showPair();
+</script>
+</body>
+</html>

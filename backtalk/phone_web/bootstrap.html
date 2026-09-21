@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Jarvis — Certificate Setup</title>
+<style>
+  :root { --bg:#0b0f10; --panel:#12181a; --line:#223033; --ink:#eafffb;
+    --dim:#7fa9a2; --cyan:#00e5ff; --orange:#ff8c3c; --red:#ff5a5a; --green:#39ffb0; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; padding:0; background:var(--bg); color:var(--ink);
+    font:15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  body { padding: env(safe-area-inset-top) 16px env(safe-area-inset-bottom) 16px; }
+  h1 { font-size:18px; letter-spacing:0.04em; margin:16px 0 4px; }
+  h2 { font-size:14px; color:var(--cyan); margin:18px 0 8px; text-transform:uppercase; letter-spacing:0.06em; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:12px;
+    padding:14px; margin-bottom:12px; }
+  .warn { background:#241a12; border:1px solid var(--orange); }
+  .danger { background:#2a1414; border:1px solid var(--red); }
+  button { padding:12px 16px; border-radius:8px; border:1px solid var(--line);
+    background:#16211f; color:var(--ink); font:inherit; cursor:pointer; width:100%; }
+  code, .mono { font-family:"SF Mono", Menlo, monospace; font-size:13px;
+    word-break:break-all; color:var(--cyan); }
+  .step { margin:8px 0; }
+  a { color:var(--cyan); }
+</style>
+</head>
+<body>
+<h1>JARVIS — Certificate Setup</h1>
+
+<div class="card warn">
+  This page is plain HTTP on purpose — it only exists to help you
+  install the certificate that makes the real app secure. Don't type
+  a message, code, or approval anywhere on this page.
+</div>
+
+<div class="card">
+  <button id="dlBtn">Download certificate</button>
+  <div id="convenience" style="display:none; margin-top:12px;">
+    <div style="color:var(--dim); font-size:12px;">
+      Quick check only (see the warning below for what actually matters):
+      this browser computed SHA-256 of the file it just received —
+    </div>
+    <div class="mono" id="clientHash" style="margin-top:6px;"></div>
+  </div>
+</div>
+
+<div class="card danger">
+  <h2 style="margin-top:0;">The comparison that actually matters</h2>
+  <div class="step">
+    This page cannot be trusted to tell you the truth about what you
+    downloaded — that's the whole reason this step exists. Instead,
+    look at <b>your phone's own certificate-install screen</b>:
+  </div>
+  <div class="step">
+    <b>iPhone:</b> after downloading, tap it → tap <b>More Details</b>
+    on the profile screen → find the fingerprint shown there.
+  </div>
+  <div class="step">
+    <b>Android:</b> the certificate-install dialog shows similar detail
+    before you confirm.
+  </div>
+  <div class="step" style="font-weight:600;">
+    SHA-256 is the ONLY value that counts. Compare that exact value
+    against the SHA-256 fingerprint on the Jarvis desktop screen (or
+    its QR code). A SHA-1 value is sometimes shown too, on either
+    side — it is informational only and must never be used to approve
+    or compare; it is never an acceptable substitute for SHA-256.
+  </div>
+  <div class="step" style="color:var(--red); font-weight:600;">
+    If your phone's SHA-256 does not match exactly, or your phone's
+    install screen does not show a SHA-256 fingerprint at all (only
+    SHA-1, or nothing): DO NOT INSTALL THIS CA ON THIS DEVICE. Close
+    this page and tell your Jarvis operator — something on this network
+    may be tampering with the connection, or this device simply can't
+    be verified safely and voice access isn't worth that risk.
+  </div>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0;">If it matches</h2>
+  <div class="step">
+    <b>iPhone:</b> Settings → General → VPN & Device Management →
+    install the profile → then Settings → General → About →
+    Certificate Trust Settings → enable full trust for it.
+  </div>
+  <div class="step">
+    <b>Android:</b> Settings → Security → Encryption &amp; credentials
+    → Install a certificate → CA certificate → select the file.
+  </div>
+  <div class="step">
+    Then open: <span class="mono" id="appUrl"></span>
+  </div>
+</div>
+
+<script>
+// {{TLS_PORT}} is substituted server-side (phone_bridge.build_bootstrap_
+// app) with the real port before this page is served -- never guessed
+// client-side, since this page has no reliable way to know it.
+document.getElementById("appUrl").textContent =
+  "https://" + location.hostname + ":{{TLS_PORT}}/";
+
+document.getElementById("dlBtn").addEventListener("click", async () => {
+  const r = await fetch("/ca.crt");
+  const buf = await r.arrayBuffer();
+  // convenience-only client-side hash -- see the danger card above for
+  // why this alone is never the security-critical comparison
+  const digest = await crypto.subtle.digest("SHA-256", buf);
+  const hex = Array.from(new Uint8Array(digest))
+    .map(b => b.toString(16).padStart(2, "0").toUpperCase()).join(":");
+  document.getElementById("clientHash").textContent = "SHA-256: " + hex;
+  document.getElementById("convenience").style.display = "block";
+
+  const blob = new Blob([buf], {type: "application/x-x509-ca-cert"});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = "jarvis-local-ca.crt";
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(url);
+});
+</script>
+</body>
+</html>

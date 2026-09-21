@@ -29,10 +29,12 @@ class LocalBrainCapabilityHonestyTests(unittest.TestCase):
         brain = DeepSeekBrain(enabled=True)
         self._assert_no_false_claims(brain.capability_summary)
 
-    def test_gemini_capability_summary_admits_stub(self):
+    def test_gemini_capability_summary_names_approval_requirement(self):
         brain = GeminiBrain()
         self._assert_no_false_claims(brain.capability_summary)
-        self.assertIn("stub", brain.capability_summary.lower())
+        low = brain.capability_summary.lower()
+        self.assertIn("approv", low)
+        self.assertIn("no vault context", low)
 
     def test_claude_capability_summary_names_real_tools_and_gate(self):
         brain = ClaudeBrain()

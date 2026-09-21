@@ -39,7 +39,12 @@ from typing import AsyncIterator
 
 import httpx
 
+from backtalk import phone_bridge
 from backtalk.brains.base import BrainAdapter, BrainDisabledError, BrainHealth
+from backtalk.identity import (JARVIS_CORE_IDENTITY,
+                               LOCAL_BRAIN_CAPABILITY_RULES,
+                               PHONE_REPLY_CAPABILITY_RULE,
+                               PROACTIVE_CHECKIN_RULES)
 
 OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 _HEALTH_TIMEOUT_S = 5
@@ -67,12 +72,27 @@ class OllamaBrain(BrainAdapter):
         "files, run commands, browse the web, or write to your vault -- "
         "those need Claude.")
 
+    # How many user/assistant TURN PAIRS to keep. Bounded so a long
+    # session's history can't grow the request payload without limit;
+    # 10 turns is generous for ordinary follow-up conversation while
+    # staying well inside any local 8B model's context window even
+    # alongside the vault excerpt.
+    _MAX_HISTORY_TURNS = 10
+
     def __init__(self, *, enabled: bool = False, context_loader=None):
         super().__init__(enabled=enabled)
         # Called fresh on every turn, never cached at construction --
         # so a same-day vault edit shows up on the next turn without a
         # restart. None means "no vault context at all" (e.g. tests).
         self._context_loader = context_loader
+        # Real field-test bug: this used to be a single [system, user]
+        # call every turn, so a follow-up like "yes, Jarvis" had
+        # nothing to resolve against and the model answered as if the
+        # conversation had just started. Now a running transcript,
+        # exactly like Claude's own conversation already had via the
+        # SDK session -- see ask_stream() for how it's appended and
+        # capped, and command() for how "/clear" empties it.
+        self._history: list[dict] = []
 
     async def _check_health(self) -> BrainHealth:
         try:
@@ -95,21 +115,41 @@ class OllamaBrain(BrainAdapter):
             raise BrainDisabledError(
                 f"{self.id} is disabled by configuration")
         vault_ctx = self._context_loader() if self._context_loader else ""
+        phone_note = (
+            f" {PHONE_REPLY_CAPABILITY_RULE}"
+            if phone_bridge.phone_reply_available() else "")
         preamble = (
-            "You are Jarvis, a local AI assistant running entirely "
-            "on-device through Ollama. No part of this conversation "
-            "leaves this machine. You have NO tools: you cannot edit "
-            "files, run commands, browse the web, or write to the "
-            "vault. If asked to do one of those, say so plainly and "
-            "suggest switching to Claude instead of pretending to do it.")
+            f"{JARVIS_CORE_IDENTITY} You're running entirely on-device "
+            f"through Ollama right now -- no part of this conversation "
+            f"leaves this machine. {LOCAL_BRAIN_CAPABILITY_RULES}"
+            f"{phone_note} "
+            f"{PROACTIVE_CHECKIN_RULES} "
+            "Your reply is SPOKEN ALOUD, not displayed: write plain "
+            "natural sentences only. Never use Markdown (no **bold**, "
+            "no # headings, no - bullet points, no numbered lists, no "
+            "code blocks, no [links](like this)), never use emoji, and "
+            "never speak a raw file path or URL -- say the file or "
+            "site by name instead. Answer the request and then stop -- "
+            "do not tack on a generic closing line like 'How may I "
+            "assist you today?', 'What would you like to explore "
+            "next?', 'Let me know if you need anything else', 'How "
+            "can I assist you?', or any rephrasing of those (for "
+            "example 'What would you like to accomplish with your "
+            "local AI assistant?' is just as banned as the exact "
+            "wording above). Only ask a follow-up question when you "
+            "genuinely need missing information to complete the "
+            "request; for an explanation, end on a concise natural "
+            "conclusion instead of a service-desk sign-off.")
         system_prompt = (
             f"{preamble} Use the following vault context if relevant; "
             f"do not invent facts beyond it.\n\n{vault_ctx}"
             if vault_ctx else preamble)
-        messages = [{"role": "system", "content": system_prompt},
-                   {"role": "user", "content": utterance}]
+        messages = [{"role": "system", "content": system_prompt}]
+        messages.extend(self._history)
+        messages.append({"role": "user", "content": utterance})
         payload = {"model": self.model, "messages": messages, "stream": True}
         buf = ""
+        full_reply: list[str] = []
         self.session["turns"] += 1
         async with httpx.AsyncClient(timeout=_CHAT_TIMEOUT_S) as client:
             async with client.stream("POST", f"{OLLAMA_BASE_URL}/api/chat",
@@ -129,14 +169,32 @@ class OllamaBrain(BrainAdapter):
                             sentence, buf = (buf[:m.end()].strip(),
                                              buf[m.end():])
                             if sentence:
+                                full_reply.append(sentence)
                                 yield sentence
                     if chunk.get("done"):
                         break
         tail = buf.strip()
         if tail:
+            full_reply.append(tail)
             yield tail
+        # Remember this exchange -- WITHOUT this, "yes, Jarvis" after a
+        # follow-up question has nothing to resolve against and the
+        # model answers as if the conversation just started (the exact
+        # bug this fixes, caught in a real field test). Capped to the
+        # last _MAX_HISTORY_TURNS pairs so a long session's payload
+        # can't grow without bound.
+        if full_reply:
+            self._history.append({"role": "user", "content": utterance})
+            self._history.append(
+                {"role": "assistant", "content": " ".join(full_reply)})
+            max_messages = self._MAX_HISTORY_TURNS * 2
+            if len(self._history) > max_messages:
+                self._history = self._history[-max_messages:]
 
     async def command(self, cmd: str) -> str:
+        if cmd.strip() == "/clear":
+            self._history = []
+            return "Cleared."
         # Ollama has no slash-command console -- the router intercepts
         # console verbs before they reach an adapter at all, so this
         # only exists to satisfy the shared interface.

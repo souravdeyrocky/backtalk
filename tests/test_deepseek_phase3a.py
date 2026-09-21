@@ -54,8 +54,12 @@ class BrainRouterConfigDeepSeekTests(unittest.TestCase):
         self.assertEqual(cfg["active_brain"], "qwen3-8b-local",
                          "Qwen must stay the default brain")
         self.assertTrue(cfg["brains"]["qwen3-8b-local"]["enabled"])
-        # Untouched this phase, per instruction:
-        self.assertFalse(cfg["brains"]["gemini"]["enabled"])
+        # Gemini's "enabled" flag is deliberately true as of the
+        # numbered-interface work: the REAL gate is GEMINI_API_KEY's
+        # presence plus a passing health check (both enforced by
+        # router.activate() itself), not this static config flag --
+        # see test_numbered_brain_interface.py for that gate's tests.
+        self.assertTrue(cfg["brains"]["gemini"]["enabled"])
 
 
 class NoSilentSwitchTests(unittest.IsolatedAsyncioTestCase):

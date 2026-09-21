@@ -6,7 +6,14 @@ requires-python = ">=3.11,<3.13"
 dependencies = [
     "claude-agent-sdk>=0.2.100",
     "faster-whisper>=1.0.0",
+    # The phone bridge (backtalk/phone_bridge.py), OFF by default. Both
+    # MIT-licensed, no telemetry, local-only usage -- serves one machine
+    # on your own Wi-Fi, never the internet.
+    "fastapi>=0.110.0",
     "httpx>=0.27.0",
+    # backtalk/phone_tls.py's terminal QR (the CA fingerprint verification
+    # screen) -- pure Python, MIT, zero sub-dependencies, no binary.
+    "segno>=1.6.0",
     "kokoro>=0.9.0",
     # Apple Silicon only: runs the SAME whisper model on the GPU.
     # CTranslate2 (under faster-whisper) has no Metal backend, so
@@ -19,6 +26,15 @@ dependencies = [
     "setuptools<81",
     "sounddevice>=0.5.0",
     "soundfile>=0.12.0",
+    # stdlib zoneinfo has no IANA tz database of its own on Windows
+    # (confirmed: ZoneInfo("Asia/Kolkata") raises ZoneInfoNotFoundError
+    # without this) -- needed so the startup greeting and the Day
+    # Journal's daily-note date boundary use Asia/Kolkata explicitly,
+    # never just whatever the Windows clock happens to be set to.
+    "tzdata>=2024.1",
+    # The phone bridge's ASGI server -- see the fastapi entry above for
+    # why this dependency exists at all.
+    "uvicorn>=0.30.0",
     # Windows has no compiler by default and upstream webrtcvad ships an
     # sdist ONLY -- no wheels for any platform -- so uv tries to build it
     # and dies demanding Visual C++ Build Tools. webrtcvad-wheels is the

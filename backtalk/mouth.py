@@ -50,6 +50,7 @@ import threading
 import numpy as np
 import sounddevice as sd
 
+from backtalk import pronunciation
 from backtalk.config import CFG
 from backtalk.vlog import log
 
@@ -332,6 +333,43 @@ def synth_stream(text: str, timeout: float = 30.0):
         yield KOKORO_RATE, pcm
 
 
+# Optional transcript sink (2026-09, the phone bridge): a plain callback
+# hook, not an import of phone_bridge.py -- this module stays dependency-
+# free of that feature. None (the default) means nothing is recorded,
+# exactly today's behavior. set by phone_bridge.start() only when the
+# phone bridge is actually enabled.
+_transcript_sink = None
+
+# Turn-complete sink (2026-09-29, fixing a real field defect: the phone
+# was only ever seeing Jarvis's reply as several separate fragments,
+# never one complete line, and never auto-played). speak_reply() in
+# main.py splits ONE reply into several say_chunk() calls on purpose
+# (first sentence alone for fast start, then 2-sentence batches for
+# livelier prosody) -- that pacing is untouched here. This hook instead
+# fires once, at the SAME point _run() already calls signals.reply_done()
+# below: the queue has genuinely drained, not just a gap between two
+# chunks of the same reply. phone_bridge uses it to know when to stop
+# buffering fragments and publish the complete reply as one atomic line.
+_turn_complete_sink = None
+
+
+def set_transcript_sink(fn) -> None:
+    global _transcript_sink
+    _transcript_sink = fn
+
+
+def set_turn_complete_sink(fn) -> None:
+    global _turn_complete_sink
+    _turn_complete_sink = fn
+
+
+# 2026-09-21, active-platform routing: the implicit target of every
+# call to say()/say_chunk() before this feature existed -- both
+# speakers, always. Kept as the explicit default so no existing caller
+# has to change to keep behaving exactly as it always did.
+_BOTH_TARGETS = frozenset({"desktop", "phone"})
+
+
 class Mouth:
     def __init__(self):
         from backtalk.ducking import Ducker
@@ -351,21 +389,41 @@ class Mouth:
         return self._speaking.is_set()
 
     def say(self, text: str):
-        """Queue text (split to sentences) for speech."""
+        """Queue text (split to sentences) for speech. Pronunciation
+        corrections apply here, last, right before the queue — see
+        pronunciation.py. Speech only: nothing upstream of this call
+        (logs, typed replies) ever sees the corrected text, only
+        Kokoro does. Always plays on desktop AND reaches the phone's
+        transcript (see say_chunk's `targets` for why) -- this is for
+        internal/system messages (errors, console confirmations,
+        signoff), never a routed brain reply."""
+        text = pronunciation.apply(text)
         for s in split_sentences(text):
-            self._q.put((s, None))
+            self._q.put((s, None, _BOTH_TARGETS))
 
-    def say_chunk(self, text: str, directions=None):
+    def say_chunk(self, text: str, directions=None, targets=None):
         """Queue text as ONE TTS request, no sentence splitting — fuller
         chunks get livelier prosody (single short sentences come out
         dull).
 
         `directions` are the stage directions this chunk carried. They are
         published on the signal bus when this chunk's audio STARTS, which
-        is why they travel with it instead of firing at parse time."""
+        is why they travel with it instead of firing at parse time.
+
+        `targets` (2026-09-21, active-platform routing): which
+        platform(s) this chunk's AUDIO should actually play on --
+        {"desktop"}, {"phone"}, or {"desktop","phone"} (the default,
+        and the ENTIRE prior behavior of this method, preserved
+        exactly for every call site that doesn't pass it). Text/
+        transcript delivery to the phone is never gated by this --
+        only which speaker(s) actually make sound. See _run()'s
+        `silent` handling for "desktop" not in targets, and
+        phone_bridge's /speak/{turn}/{chunk}.wav for "phone" not in
+        targets."""
         text = text.strip()
+        text = pronunciation.apply(text)
         if text:
-            self._q.put((text, directions or None))
+            self._q.put((text, directions or None, targets or _BOTH_TARGETS))
 
     def shut_up(self):
         """Barge-in: stop current playback and flush everything queued."""
@@ -395,8 +453,28 @@ class Mouth:
         from backtalk import signals
         while True:
             item = self._q.get()
-            sentence, directions = item if isinstance(item, tuple) else (item, None)
+            if isinstance(item, tuple) and len(item) == 3:
+                sentence, directions, targets = item
+            elif isinstance(item, tuple):
+                sentence, directions, targets = item[0], item[1], _BOTH_TARGETS
+            else:
+                sentence, directions, targets = item, None, _BOTH_TARGETS
             if not sentence:
+                continue
+            if _transcript_sink is not None:
+                try:
+                    _transcript_sink("jarvis", sentence, targets=targets)
+                except Exception as e:
+                    log(f"[mouth] transcript sink failed (non-fatal): {e}")
+            if "desktop" not in targets:
+                # 2026-09-21, active-platform routing: this chunk is
+                # routed phone-only. The transcript sink call above
+                # already did this chunk's entire job -- phone_bridge
+                # buffers the text and serves its own independent
+                # synthesis via /speak. No desktop audio, so no
+                # speaking-state signal and nothing to duck.
+                if self._q.empty():
+                    self._on_drained(desktop_audio_happened=False)
                 continue
             self._stop.clear()
             self._speaking.set()
@@ -409,12 +487,29 @@ class Mouth:
                 log(f"[mouth] synth/play error: {e}")
             finally:
                 if self._q.empty():
-                    self._speaking.clear()
-                    # The reply has genuinely stopped talking, as opposed to
-                    # the gap between two sentences of the same reply.
-                    signals.reply_done()
-                    self.ducker.speech_end()
-                    signals.set_state("idle")
+                    self._on_drained(desktop_audio_happened=True)
+
+    def _on_drained(self, desktop_audio_happened: bool):
+        """Called once the queue empties after an item, whether or not
+        that item actually made desktop sound -- reply_done/turn-
+        complete/idle are REPLY-lifecycle signals (something watching
+        them wants to know the whole reply finished, regardless of
+        which platform's speaker it came out of) and fire either way;
+        only the desktop-specific bits (the speaking flag, ducking)
+        are gated on whether desktop audio actually happened."""
+        from backtalk import signals
+        if desktop_audio_happened:
+            self._speaking.clear()
+            self.ducker.speech_end()
+        # The reply has genuinely stopped talking, as opposed to the
+        # gap between two sentences of the same reply.
+        signals.reply_done()
+        if _turn_complete_sink is not None:
+            try:
+                _turn_complete_sink()
+            except Exception as e:
+                log(f"[mouth] turn-complete sink failed (non-fatal): {e}")
+        signals.set_state("idle")
 
     def _get_out(self, rate: int) -> sd.OutputStream:
         """The long-lived stream (audio law #1). Reopened only when the

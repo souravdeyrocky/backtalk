@@ -31,6 +31,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from backtalk import speech_format
 from backtalk.brains import config as router_config
 from backtalk.brains import tool_intent, vault_context
 from backtalk.brains.base import (
@@ -80,7 +81,9 @@ def _build_registry(cfg: dict, *, can_use_tool=None,
         "gemini": GeminiBrain(
             enabled=b.get("gemini", {}).get("enabled", False),
             api_key_env=b.get("gemini", {}).get("api_key_env",
-                                                 "GEMINI_API_KEY")),
+                                                 "GEMINI_API_KEY"),
+            **({"model": b["gemini"]["model"]}
+               if b.get("gemini", {}).get("model") else {})),
         "claude": ClaudeBrain(
             enabled=b.get("claude", {}).get("enabled", False),
             model=b.get("claude", {}).get("model"),
@@ -179,8 +182,19 @@ class BrainRouter:
                 utterance):
             yield tool_intent.REFUSAL
             return
+        # THE SHARED SPEECH RENDERER: every brain's reply passes through
+        # the same sanitizer here, in exactly one place, so the voice
+        # experience never depends on which brain answered. Applied to
+        # each already-complete sentence/chunk an adapter yields, never
+        # to a raw streaming fragment (a markdown span can straddle two
+        # network chunks mid-token). Claude's own output is already
+        # clean prose (DISCIPLINE tells it to write for the ear), so
+        # this is a no-op backstop for it and the actual fix for Qwen
+        # and DeepSeek, which carry no such instruction of their own.
         async for sentence in active.ask_stream(utterance):
-            yield sentence
+            cleaned = speech_format.to_speech(sentence)
+            if cleaned:
+                yield cleaned
 
     @property
     def session(self) -> dict:

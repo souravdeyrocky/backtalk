@@ -35,6 +35,14 @@ class ClaudeBrain(BrainAdapter):
     label = "Claude (Agent SDK -- consumes your subscription usage)"
     requires_tools = True
     requires_confirm_to_switch = True
+    # External consent lease (see base.py): confirming the switch
+    # opens a 30-minute idle window; after it expires the next request
+    # shows its exact outgoing text and asks for consent again. This
+    # is layered ON TOP OF, and completely separate from, the existing
+    # per-TOOL-USE permission gate (make_permission_gate in main.py) --
+    # that one still asks before every single file edit/command/fetch
+    # regardless of the lease, unchanged.
+    requires_external_lease = True
     capability_summary = (
         "the full Claude Agent SDK toolset -- file edits, running "
         "commands, web fetch, and vault writes -- every one of them "

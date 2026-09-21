@@ -67,6 +67,7 @@ Flags:
 Say "goodbye <name>" / "end voice mode" to hang up. Ctrl-C works.
 """
 import asyncio
+import datetime
 import json
 import queue
 import re
@@ -74,10 +75,18 @@ import socket
 import sys
 import threading
 import time
+import zoneinfo
 
-from backtalk import signals
+# Explicit, never assumed from the system clock's own configured
+# timezone -- see _startup_greeting_line()'s docstring. Requires the
+# tzdata package (pyproject.toml): Windows ships no IANA tz database
+# of its own for stdlib zoneinfo to read.
+IST = zoneinfo.ZoneInfo("Asia/Kolkata")
+
+from backtalk import day_journal, phone_auth, phone_bridge, phone_tls, signals
 from backtalk.brains import brain_intent
 from backtalk.brains import config as brain_router_config
+from backtalk.brains import recommend
 from backtalk.brains.base import BrainDisabledError, BrainUnavailableError
 from backtalk.config import CFG
 from backtalk.ears import (Ears, explain_audio_failure, record_held,
@@ -100,6 +109,27 @@ PERM_TIMEOUT_S = 75
 _PERM = {"fut": None, "asked_at": 0.0,   # pending ask + when it was posed
          "hinted": False}                # escape-hatch hint said yet?
 _CONFIRM = {"verb": None, "at": 0.0}     # pending "say confirm" + when
+# EXTERNAL CONSENT LEASE (Claude and Gemini): confirming the switch
+# opens a window of this many seconds during which requests to that
+# brain send without re-asking; each actual send refreshes it (an
+# IDLE lease, not a fixed session length). Kept as its OWN dedicated
+# state (never reusing _CONFIRM or _PERM) specifically so it can never
+# interact with or risk the existing Claude tool-permission gate or
+# the brain-SWITCH confirm flow.
+_LEASE_DURATION_S = 30 * 60
+_EXTERNAL_LEASE = {"brain_id": None, "expires_at": 0.0}
+# Pending consent for the NEXT send to an external brain -- armed only
+# when that brain has no currently-valid lease (never confirmed yet,
+# or the lease expired). brain_id is checked on resolution so a stale
+# pending consent from a brain Captain has since switched away from
+# can never fire.
+_EXTERNAL_PENDING = {"text": None, "brain_id": None, "at": 0.0}
+# A bare "switch" asks which number and stores that as one-turn
+# context: only the VERY NEXT utterance, and only if it's just a bare
+# number ("3", "three"), resolves it -- anything else (including
+# ordinary conversation that happens to be said next) falls through
+# normally, exactly like every other pending-state gate here.
+_BRAIN_NUM_PENDING = {"pending": False, "at": 0.0}
 _INTERRUPT_ANSWER = "\x00interrupt"      # sentinel: turn is being killed
 # Live AUTO-APPROVE is OUR flag, not an SDK mode flip: the CLI refuses
 # a live switch INTO bypassPermissions unless it was launched with the
@@ -122,6 +152,32 @@ _AUTOAPPROVE = {"on": False}
 # processed.
 _MIC = {"mode": "ptt", "gen": 0, "btn": False}
 
+# Active-platform reply routing (2026-09-21). None = automatic: each
+# reply's audio goes to wherever ITS OWN utterance came from (rule 2/
+# 3 -- a phone turn speaks only on the phone, a desktop turn speaks
+# only on desktop). "phone"/"desktop"/"both" is a standing override
+# set by an explicit command (rule 4: "reply on phone" etc, see the
+# replyphone/replydesktop/replyboth/replyauto console verbs below),
+# in force until changed again. Session-only by design, not written to
+# backtalk.json -- a live routing choice, not a persistent preference.
+_REPLY_TARGET_OVERRIDE = {"mode": None}
+
+
+def _resolve_reply_targets(source_platform: str) -> frozenset:
+    """Where a reply's AUDIO should actually play -- never gates text/
+    transcript visibility, which phone_bridge always records
+    regardless (see mouth.py's _on_drained and record_transcript_line
+    call). An explicit override (rule 4) always wins; with none, the
+    turn's own origin decides (rule 2/3)."""
+    override = _REPLY_TARGET_OVERRIDE["mode"]
+    if override == "phone":
+        return frozenset({"phone"})
+    if override == "desktop":
+        return frozenset({"desktop"})
+    if override == "both":
+        return frozenset({"desktop", "phone"})
+    return frozenset({source_platform})
+
 # Approvals are EXACT matches after normalization, never prefixes:
 # "yesterday", "yes or no", and "yes, but do not overwrite" must all
 # fail. Anything that is not an exact yes DENIES, with the words passed
@@ -140,6 +196,36 @@ _YES = {"yes", "yeah", "yep", "yup", "sure", "approve", "approved",
         "you may", "allowed", "allow it", "confirmed", "affirmative"}
 _CHAIN_MARKS = ("&&", "||", ";", "|", "$(", "`", "\n")
 
+# Resolves a PENDING brain-switch or external-lease confirm (_CONFIRM
+# / _EXTERNAL_PENDING) -- deliberately separate from _YES above (that
+# one answers a Claude tool permission ask, a different question
+# entirely). Real live-test misses this closes: "conform"/"conformed"
+# (Whisper mis-hearing "confirm", same shape as "QN3" for "Qwen"
+# elsewhere in this file) and "Thank you, confirmed." (a polite prefix
+# an exact-set-membership check could never match). Shared by every
+# place that resolves a pending confirm so all of them accept exactly
+# the same variants -- this must NEVER be consulted outside an actual
+# pending confirmation (each caller only checks it inside its own "is
+# something pending" branch).
+_CONFIRM_WORD = r"(?:confirm|confirmed|conform|conformed)"
+_CONFIRM_NEGATED = re.compile(
+    r"\b(do not|don't|dont|never|not|won't|wont|will not|didn't|"
+    r"didnt)\b[^.!?]{0,20}\b" + _CONFIRM_WORD + r"\b", re.IGNORECASE)
+_CONFIRM_PHRASE = re.compile(
+    r"^(thank you )?(yes )?" + _CONFIRM_WORD + r"$", re.IGNORECASE)
+
+
+def _is_confirm_phrase(text: str) -> bool:
+    """True iff `text` is an accepted confirmation -- case/punctuation
+    ignored, a small set of real Whisper mis-hearings and a polite
+    prefix tolerated -- but NEVER when negated ("do not confirm").
+    The negation check runs on the raw lowercased text (contractions
+    like "don't" intact); _norm_speech's own letters-only collapse
+    would otherwise mangle "don't" into "don t" and lose the word."""
+    if _CONFIRM_NEGATED.search(text.lower()):
+        return False
+    return bool(_CONFIRM_PHRASE.match(_norm_speech(text)))
+
 
 def _norm_speech(text):
     """Lowercase, every non-letter to space, collapse. Whisper loves
@@ -148,6 +234,25 @@ def _norm_speech(text):
     for ch in text.lower():
         out.append(ch if "a" <= ch <= "z" else " ")
     return " ".join("".join(out).split())
+
+
+# Deliberately NOT built on _norm_speech: that helper maps every
+# non-letter (digits included) to a space, which would erase a bare
+# "3" entirely before this could ever see it.
+_BARE_NUM = re.compile(
+    r"^(?:brain\s+)?(1|one|2|two|3|three|tree|4|four)[.!]?$",
+    re.IGNORECASE)
+
+
+def _bare_brain_number(text: str) -> str | None:
+    """Only matches a BARE number (optionally "brain N"), nothing
+    else -- this must never fire on ordinary conversation that happens
+    to contain a number word, so it's only ever consulted while
+    _BRAIN_NUM_PENDING is actually pending (see handle())."""
+    m = _BARE_NUM.match(text.strip().strip("?.! "))
+    if not m:
+        return None
+    return brain_intent._NUM_TO_ID[m.group(1).lower()]
 
 
 def _deny_pending(reason=_INTERRUPT_ANSWER):
@@ -251,6 +356,11 @@ def make_permission_gate(mouth):
             ask += (" And any time you're done with these checks, say "
                     "stop asking for permission.")
         mouth.say(ask)
+        # Phone-visible mirror of this same ask (2026-09) -- the phone's
+        # Yes/No buttons just POST "yes"/"no" into typed_q like any
+        # other typed text; this line only lets the phone page know a
+        # question is pending so it can show it. No second approval path.
+        phone_bridge.set_pending_permission(ask)
         answer = None
         try:
             deadline = loop.time() + PERM_TIMEOUT_S
@@ -268,6 +378,8 @@ def make_permission_gate(mouth):
                             fut.cancel()
                             mouth.say("No answer, so I didn't do it.")
                             log("[perm]   timed out, denied")
+                            day_journal.record_event(
+                                "denied_action", f"{what} (no answer)")
                             return PermissionResultDeny(
                                 behavior="deny",
                                 message="No spoken answer within the "
@@ -283,13 +395,15 @@ def make_permission_gate(mouth):
                     # fresh clock: asking for details is engagement,
                     # not silence
                     log("[perm]   details requested")
-                    mouth.say(f"The details: I want to {detail}. "
-                              "Yes or no?")
+                    detail_ask = f"The details: I want to {detail}. Yes or no?"
+                    mouth.say(detail_ask)
+                    phone_bridge.set_pending_permission(detail_ask)
                     deadline = loop.time() + PERM_TIMEOUT_S
                     continue
                 answer = got
         finally:
             _PERM["fut"] = None
+            phone_bridge.set_pending_permission(None)
         if answer == _INTERRUPT_ANSWER:
             log("[perm]   turn interrupted, denied silently")
             return PermissionResultDeny(
@@ -303,8 +417,10 @@ def make_permission_gate(mouth):
         signals.static_start()
         if approved:
             log("[perm]   approved by voice")
+            day_journal.record_event("approved_action", what)
             return PermissionResultAllow(behavior="allow")
         log(f"[perm]   denied: {answer!r}")
+        day_journal.record_event("denied_action", what)
         return PermissionResultDeny(
             behavior="deny",
             message=f'Denied by voice. The user said: "{answer[:500]}"',
@@ -351,11 +467,41 @@ CONSOLE_VERBS = {
     "usedeepseek": ("switch to deep reasoning", "use deep reasoning",
                     "switch to deepseek", "use deepseek",
                     "deep reasoning mode", "think harder"),
+    "usegemini": ("switch to gemini", "use gemini"),
     "whichbrain": ("which brain are you using", "what brain is this",
                    "which brain is active", "what brain are you on",
                    "brain status", "which brain"),
+    "closeday": ("close the day", "summarise today", "summarize today",
+                "make today's note", "make todays note",
+                "end of day summary"),
+    "listbrains": ("list brains", "brain options", "which brains"),
+    "switchask": ("switch",),
+    "memorymodules": ("how many memory modules do you have",
+                      "how many memory systems do you have",
+                      "how many vaults do you have"),
+    "pairphone": ("pair a phone", "pair phone", "pair my phone",
+                  "add a phone"),
+    "listphones": ("list paired phones", "which phones are paired",
+                   "list phones"),
+    "showphonecert": ("show phone certificate", "show certificate fingerprint",
+                      "show the certificate fingerprint"),
+    "replyphone": ("reply on phone", "reply on my phone",
+                  "answer on phone", "answer on my phone"),
+    "replydesktop": ("reply on computer", "reply on the computer",
+                     "reply on desktop", "answer on computer",
+                     "answer on the computer", "answer on desktop"),
+    "replyboth": ("reply on both", "answer on both", "reply everywhere"),
+    "replyauto": ("reply automatically", "reply as normal",
+                 "normal reply routing", "stop overriding replies"),
 }
 _EFFORTS = ("low", "medium", "high", "xhigh", "max")
+# "revoke phone N" / "remove phone N" / "unpair phone N" -- a one-shot
+# regex rather than the numbered-pending two-step _BRAIN_NUM_PENDING
+# machinery uses: revocation is a rare admin action, not a conversational
+# flow, so requiring the number in the same utterance is the simpler,
+# lower-risk choice here.
+_REVOKE_PHONE_RE = re.compile(
+    r"^(?:revoke|remove|unpair)\s+phone\s+(\d+)$")
 
 
 def console_match(text):
@@ -367,6 +513,9 @@ def console_match(text):
         if norm in (f"set effort to {lvl}", f"effort {lvl}",
                     f"slash effort {lvl}"):
             return f"effort:{lvl}"
+    m = _REVOKE_PHONE_RE.match(norm)
+    if m:
+        return f"revokephone:{m.group(1)}"
     return None
 
 
@@ -426,6 +575,216 @@ def _spoken_usage(sess, ctx_usage):
     except Exception:
         pass
     return ". ".join(parts) + "."
+
+
+def _greeting_period(hour: int) -> str:
+    if hour < 12:
+        return "morning"
+    if hour < 17:
+        return "afternoon"
+    return "evening"
+
+
+def _startup_greeting_line(now: "datetime.datetime | None" = None) -> str:
+    """Exact required format, spoken ONCE per launch (see amain()'s one
+    call site) after Kokoro has genuinely finished loading -- the
+    queued text below is itself what triggers mouth.warm() the first
+    time the playback thread dequeues it, so nothing can play before
+    voice is ready. Uses Asia/Kolkata EXPLICITLY (zoneinfo, via the
+    tzdata package -- stdlib zoneinfo has no IANA database of its own
+    on Windows) rather than assuming the machine's own clock is set to
+    IST: a wrong system timezone used to mean a wrong greeting with no
+    way to tell from the text alone."""
+    now = now or datetime.datetime.now(IST)
+    period = _greeting_period(now.hour)
+    time_str = now.strftime("%I:%M %p").lstrip("0")
+    return f"Good {period}, Captain. Jarvis is online. It is {time_str}."
+
+
+def _qwen_confirmation_line(router, *, already_active: bool) -> str:
+    """Clean confirmation only -- one sentence, the brain's real name
+    and nothing else. Never mentions any other interface: F8/Backtalk
+    is the one Jarvis interface, and this line is the proof of it --
+    it can never say "F9" or "Local Voice Bridge" because it never
+    constructs text from anything but the brain's own label."""
+    qwen_label = router.get("qwen3-8b-local").label
+    if already_active:
+        return f"{qwen_label} is already active, Captain."
+    return f"{qwen_label} is active, Captain."
+
+
+def _cloudbrain_line(*, already_active: bool) -> str:
+    """Exact required text for the deterministic "cloud brain" fix --
+    a fixed string, not built from router state, on purpose: never
+    mentions Gemini (it isn't configured), and always names Claude by
+    the one phrasing Captain approved live. Distinct from
+    useclaude's own prompt ("Switching to Claude uses your
+    subscription usage...") because this is the exact wording a real
+    field test required for the "cloud brain" phrasing specifically."""
+    if already_active:
+        return "Already on Claude."
+    return ("Claude Agent SDK is the available cloud brain. Switching "
+            "gives it access to its Agent tools and may use my Claude "
+            "subscription. Shall I switch to Claude? Say confirm to "
+            "proceed.")
+
+
+# The stable numbered interface: these four never move, regardless of
+# which brains are currently enabled/active -- 1=Qwen, 2=DeepSeek,
+# 3=Claude, 4=Gemini, always.
+_NUM_LABELS = {
+    "1": ("qwen3-8b-local", "Qwen3 8B Local"),
+    "2": ("deepseek-r1-8b-local", "DeepSeek R1 8B Local"),
+    "3": ("claude", "Claude Agent SDK"),
+    "4": ("gemini", "Gemini"),
+}
+
+
+def _numbered_brain_menu(router) -> str:
+    """Always names all four stable slots, Brain 4/Gemini included by
+    name even when it's unconfigured -- an earlier version of this
+    answer only narrated ENABLED brains and said "three configured
+    brain modes" while silently omitting Gemini, a real live-test
+    complaint. The numbers are canonical and never change shape based
+    on config. Shared verbatim by both "brainscount" and "listbrains"
+    in _run_console_inner, so the two questions always agree."""
+    status = router.status()
+    parts = []
+    for num in ("1", "2", "3", "4"):
+        bid, label = _NUM_LABELS[num]
+        if bid == status.active_id:
+            state = "is active"
+        elif bid == "claude":
+            state = "needs your confirmation to use"
+        elif bid == "gemini":
+            gemini = status.brains.get("gemini")
+            state = ("is available, gated the same way as Claude"
+                     if gemini and gemini.enabled
+                     else "is not configured yet")
+        else:
+            state = "is available"
+        parts.append(f"Brain {num}, {label}, {state}")
+    return "Captain, here are the brain options: " + "; ".join(parts) + "."
+
+
+_MEMORY_BRAIN_LINE = (
+    "Your vault memory is shared by all brain modes; it is not a "
+    "separate brain. Say switch to 1, 2, 3, or 4.")
+
+_MEMORY_MODULES_LINE = (
+    "Captain, I use one shared persistent memory system: your vault. "
+    "All four brain modes use the same vault identity and selected "
+    "context; they do not have separate memory vaults.")
+
+
+def _switchnum3_line(*, already_active: bool) -> str:
+    """Exact required text for brain 3 -- distinct wording from both
+    useclaude's own prompt and _cloudbrain_line's, because a real
+    field spec asked for this exact sentence when the NUMBER is what
+    was said, not the word "claude" or "cloud"."""
+    if already_active:
+        return "Already on brain 3, Claude Agent SDK."
+    return ("Brain 3 is Claude Agent SDK. It may use my Claude "
+            "subscription and Agent tools. Say confirm to switch.")
+
+
+def _switchnum4_line(*, already_active: bool) -> str:
+    """Exact required text for brain 4 (Gemini) -- distinct wording
+    from usegemini's own ask, because a real field spec asked for this
+    exact sentence when the NUMBER is what was said. No longer a
+    permanent refusal: Gemini activates through the SAME confirm gate
+    as every other numbered brain once GEMINI_API_KEY is present and
+    its health check passes -- that gating is enforced by
+    router.activate() itself (BrainDisabledError/BrainUnavailableError),
+    never duplicated or second-guessed here."""
+    if already_active:
+        return "Already on brain 4, Gemini."
+    return ("Brain 4 is Gemini, an external free-tier service. I "
+            "will send only your next approved prompt, not your "
+            "vault. Say confirm to switch.")
+
+
+def _gemini_activated_line() -> str:
+    """Required announcement, verbatim, every time Gemini actually
+    becomes active -- reached from BOTH "switch to Gemini" and "switch
+    to 4" (they converge on the same usegemini:confirmed verb, see
+    _run_console_inner). Never a silent swap into an external service.
+    Names the external-consent LEASE explicitly: this confirm opens a
+    thirty-minute idle window, not a promise to ask again on literally
+    every request."""
+    return ("Gemini free-tier external mode is active for the next "
+            "thirty minutes of use. Requests leave this PC only "
+            "during that window; I'll ask again after thirty minutes "
+            "of inactivity. Say switch to Qwen any time to go back.")
+
+
+def _claude_activated_line() -> str:
+    """Companion to _gemini_activated_line() for Claude -- same
+    external-consent lease, same thirty-minute idle window, distinct
+    disclosure (subscription usage and Agent tools, not "leaves this
+    PC" -- Claude's own separate per-TOOL permission gate is what
+    actually governs file/command/fetch access, unchanged by this)."""
+    return ("Claude is active for the next thirty minutes of use. "
+            "I'll ask again after thirty minutes of inactivity. Say "
+            "switch to Qwen any time to go back.")
+
+
+def _gemini_preview_line(preview: str) -> str:
+    """Exact required format for the external-consent prompt (first
+    use each lease, or after a thirty-minute idle expiry) -- the
+    EXACT outgoing text is embedded verbatim (never paraphrased),
+    followed by the fixed disclosure and confirm instruction."""
+    return f"Gemini preview: {preview} This leaves your PC. Say confirm to send."
+
+
+def _claude_preview_line(preview: str) -> str:
+    """Companion to _gemini_preview_line() for Claude."""
+    return (f"Claude preview: {preview} This uses your Claude "
+            f"subscription and Agent tools. Say confirm to send.")
+
+
+def _external_preview_line(brain_id: str, preview: str) -> str:
+    """Picks the right exact-wording preview for whichever external
+    brain is asking -- single dispatch point so callers never have to
+    know which brain uses which phrasing."""
+    if brain_id == "gemini":
+        return _gemini_preview_line(preview)
+    return _claude_preview_line(preview)
+
+
+def _start_external_lease(brain_id: str) -> None:
+    """Opens (or refreshes) the external-consent lease for `brain_id`.
+    Called once when a switch is confirmed, and again on every actual
+    send while the lease is still valid -- an IDLE window, not a fixed
+    session length."""
+    _EXTERNAL_LEASE["brain_id"] = brain_id
+    _EXTERNAL_LEASE["expires_at"] = time.monotonic() + _LEASE_DURATION_S
+
+
+def _clear_external_lease() -> None:
+    """Switching to Qwen or DeepSeek immediately clears any external
+    lease -- called explicitly rather than left to an implicit
+    brain_id mismatch, so the intent reads plainly at the call site."""
+    _EXTERNAL_LEASE["brain_id"] = None
+    _EXTERNAL_LEASE["expires_at"] = 0.0
+
+
+def _external_lease_active(brain_id: str) -> bool:
+    return (_EXTERNAL_LEASE["brain_id"] == brain_id
+            and time.monotonic() < _EXTERNAL_LEASE["expires_at"])
+
+
+def _log_external_send(brain_id: str, text: str) -> None:
+    """Logged immediately before every real external send -- concise,
+    and never carrying anything but the approved utterance itself: no
+    secret, vault, or hidden context is ever available to log here in
+    the first place (see build_request_preview() -- the bare
+    utterance is the only thing either external brain ever receives)."""
+    if brain_id == "gemini":
+        log(f"[gemini] sending approved user request: {text}")
+    else:
+        log(f"[{brain_id}] sending approved user request: {text}")
+
 
 _PASTE_ON = "\x1b[200~"    # bracketed-paste markers (we enable the mode below)
 _PASTE_OFF = "\x1b[201~"
@@ -608,19 +967,54 @@ def _typed_reader(q: "queue.Queue[str]"):
                 sys.stdout.flush()
 
 
-async def speak_reply(router: BrainRouter, mouth: Mouth, text: str):
+_BOTH_TARGETS = frozenset({"desktop", "phone"})
+_PHONE_ONLY_TARGET = frozenset({"phone"})
+
+
+async def speak_reply(router: BrainRouter, mouth: Mouth, text: str,
+                      targets: frozenset = _BOTH_TARGETS):
     """First sentence ships alone (fast start); the rest go in
     2-sentence breaths — fuller chunks get livelier prosody (single
     short sentences come out flat). `router` picks the sentences up
     from whichever brain is currently active -- this function has no
-    idea which one that is, and doesn't need to."""
+    idea which one that is, and doesn't need to.
+
+    `targets` (2026-09-21, active-platform routing): which speaker(s)
+    this reply's audio should actually reach -- forwarded to every
+    mouth.say_chunk() call below. Defaults to both, the entire prior
+    behavior of this function, for any caller that doesn't pass it.
+
+    Rule 6 (a paired phone disconnecting mid-turn must fall back to
+    desktop, never silently vanish): a phone-only turn whose phone
+    isn't reachable gets an announced desktop fallback before the
+    real answer starts; emit() re-checks on every sentence so a
+    disconnect partway through the SAME reply is caught too, not just
+    one that already existed before the turn began."""
     t0 = time.time()
     first = True
     batch: list[str] = []
     pending: list[str] = []          # directions waiting for their chunk
+    fell_back = False
+    if targets == _PHONE_ONLY_TARGET and not phone_bridge.phone_reply_available():
+        targets = frozenset({"desktop"})
+        fell_back = True
+        log("[phone] reply was routed phone-only but the phone isn't "
+            "reachable -- falling back to desktop")
+        mouth.say_chunk(
+            "Your phone isn't reachable right now, so I'm answering "
+            "here instead.", targets=targets)
 
     def emit(raw: str):
-        nonlocal first, batch, pending
+        nonlocal first, batch, pending, targets, fell_back
+        if (not fell_back and targets == _PHONE_ONLY_TARGET
+                and not phone_bridge.phone_reply_available()):
+            targets = frozenset({"desktop"})
+            fell_back = True
+            log("[phone] phone disconnected mid-reply -- falling back "
+                "to desktop for the rest of this turn")
+            mouth.say_chunk(
+                "Your phone disconnected, so I'm finishing this reply "
+                "here instead.", targets=targets)
         # STAGE DIRECTIONS: your agent may write <<anything>> inline. It is
         # lifted out here, never spoken, and published on the signal bus when
         # this chunk's audio starts (signals.direction). backtalk has no
@@ -639,14 +1033,14 @@ async def speak_reply(router: BrainRouter, mouth: Mouth, text: str):
         if first:
             log(f"[{NAME}] ({time.time()-t0:.1f}s to first) {s}"
                 + (f"  <directions: {pending}>" if pending else ""))
-            mouth.say_chunk(s, pending)
+            mouth.say_chunk(s, pending, targets=targets)
             pending = []
             first = False
         else:
             log(f"[{NAME}] {s}" + (f"  <directions: {pending}>" if pending else ""))
             batch.append(s)
             if len(batch) >= 2:
-                mouth.say_chunk(" ".join(batch), pending)
+                mouth.say_chunk(" ".join(batch), pending, targets=targets)
                 pending = []
                 batch = []
 
@@ -654,7 +1048,7 @@ async def speak_reply(router: BrainRouter, mouth: Mouth, text: str):
         async for sentence in router.ask_stream(text):
             emit(sentence)
         if batch:
-            mouth.say_chunk(" ".join(batch), pending)
+            mouth.say_chunk(" ".join(batch), pending, targets=targets)
             pending = []
         if first:
             # Zero sentences yielded (brain error / empty turn): nothing
@@ -667,6 +1061,39 @@ async def speak_reply(router: BrainRouter, mouth: Mouth, text: str):
         except Exception:
             pass
         raise
+    except (BrainDisabledError, BrainUnavailableError) as e:
+        # A brain can fail MID-STREAM -- a Gemini timeout, an HTTP
+        # error, a bad key, a rate-limit, a malformed response, etc.
+        # Without this handler the exception propagated straight out
+        # of this function unhandled (only CancelledError was ever
+        # caught here), leaving the voice line stuck "thinking"
+        # forever: nothing ever reset the state or spoke a word about
+        # it. No retry, no fallback to a different brain -- the active
+        # brain never changes just because one turn failed; Captain
+        # hears exactly what went wrong and decides what to do next.
+        # The exception message is already key-safe by construction
+        # (see gemini_brain.py -- error text names the ENV VAR, never
+        # the key's value), so this never risks printing it.
+        log(f"[{NAME}] brain error mid-turn: {e}")
+        day_journal.record_event("error", str(e))
+        signals.static_stop()
+        signals.set_state("idle")
+        mouth.say_chunk(f"Sorry, I hit an error: {e}"[:300], targets=targets)
+
+
+async def _answer_then_recommend(router: BrainRouter, mouth: Mouth,
+                                 text: str, rec,
+                                 targets: frozenset = _BOTH_TARGETS) -> None:
+    """Answers normally on whatever brain is already active, THEN --
+    only if the turn actually completed, never on a cancelled/
+    interrupted one, since CancelledError propagates straight through
+    the await below -- speaks a short suggestion if recommend.py found
+    a genuinely better-suited brain for this request. Never switches
+    anything itself. `targets` (active-platform routing) rides along
+    to the suggestion too -- it's part of the same turn."""
+    await speak_reply(router, mouth, text, targets=targets)
+    if rec:
+        mouth.say_chunk(rec.spoken_line, targets=targets)
 
 
 async def amain():
@@ -733,7 +1160,13 @@ async def amain():
     log(f"[backtalk] up — agent={NAME} dir={CFG['agent_dir']} "
         f"brain={default_brain.label} mic={mode} "
         f"(say 'goodbye {NAME.lower()}' to hang up)")
-    mouth.say(CFG["greeting"])
+    # The Jarvis-specific greeting REPLACES upstream backtalk's own
+    # CFG["greeting"]/greeting_open_mic template here (that mechanism
+    # stays untouched in config.py for upstream compatibility -- it's
+    # just not what this call site uses anymore). Exactly once per
+    # launch: this is the only call site, and amain() runs once per
+    # process.
+    mouth.say(_startup_greeting_line())
     if recovery_mode:
         mouth.say(f"Heads up — recovery mode. I'm booting straight "
                   f"into {default_brain.label} because that's what "
@@ -793,6 +1226,45 @@ async def amain():
     threading.Thread(target=_typed_reader, args=(typed_q,), daemon=True).start()
     typed_fut: asyncio.Future | None = None
 
+    # PHONE BRIDGE (2026-09, off by default): pushes phone-typed/spoken
+    # text onto this SAME typed_q, so it reaches handle() exactly like
+    # stdin -- no second brain route, no second approval path. See
+    # phone_bridge.py's module docstring. Two independent ways to say
+    # "off" both actually mean it: enabled=false always wins regardless
+    # of mode, and mode="disabled" always wins regardless of enabled.
+    async def _phone_interrupt() -> None:
+        """Wired into phone_bridge as the immediate on-press barge-in:
+        called the INSTANT Captain's thumb touches Hold-to-talk on the
+        phone, before any recording or transcription happens -- unlike
+        the interrupt block inside handle() below, which only fires
+        once a full utterance has already arrived (seconds later, for
+        voice). Same cancellation path as that block: cancel
+        speak_task, mouth.shut_up() to silence whatever's mid-play on
+        BOTH phone and desktop (Kokoro/ElevenLabs share the one
+        OutputStream), then await the cancellation actually landing
+        before returning -- so phone_bridge's /interrupt endpoint only
+        acks once real silence has landed, matching "wait for
+        acknowledgement, then capture/send the new request.\""""
+        nonlocal speak_task
+        _deny_pending()
+        if speak_task and not speak_task.done():
+            log("[turn] interrupted by phone hold-to-talk press")
+            speak_task.cancel()
+        mouth.shut_up()
+        if speak_task:
+            try:
+                await speak_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+            speak_task = None
+
+    _phone_cfg = CFG.get("phone") or {}
+    if _phone_cfg.get("enabled") and (_phone_cfg.get("mode") or "disabled") != "disabled":
+        phone_bridge.start(typed_q, router)
+        phone_bridge.set_interrupt_handler(_phone_interrupt)
+
     async def run_console(verb):
         """One voice-console verb. The current reply was already
         cancelled and awaited by handle(); the pipe gets drained here
@@ -806,9 +1278,25 @@ async def amain():
             signals.set_state("idle")
 
     async def _run_console_inner(verb):
+        nonlocal speak_task
         _deny_pending()
         await router.reset_turn()
         say_after = None
+        # Brain 1/2 switch directly and 3/4's confirmed step activates
+        # exactly like "switch to Claude"/"switch to Gemini" already
+        # do -- rather than duplicate that logic, the numbered verb is
+        # translated onto the EXISTING verb here, so there's exactly
+        # one place each actually runs. Brain 3/4's INITIAL ask keeps
+        # its own distinct handling below (see _switchnum3_line/
+        # _switchnum4_line) since those need their own exact wording.
+        if verb == "switchnum:1":
+            verb = "useqwen"
+        elif verb == "switchnum:2":
+            verb = "usedeepseek"
+        elif verb == "switchnum:3:confirmed":
+            verb = "useclaude:confirmed"
+        elif verb == "switchnum:4:confirmed":
+            verb = "usegemini:confirmed"
 
         def _claude_only_refusal(what):
             active = router.status().brains.get(router.active_id)
@@ -818,12 +1306,11 @@ async def amain():
                     f"first if you want it.")
 
         if verb == "clear":
-            if router.active_id != "claude":
-                resp = ""
-                say_after = _claude_only_refusal("session to clear")
-            else:
-                resp = await router.command("/clear")
-                say_after = "Cleared. Fresh slate."
+            # Now meaningful for every brain: Claude's SDK session and
+            # an Ollama brain's own running transcript (added alongside
+            # the conversation-continuity fix) both understand /clear.
+            resp = await router.command("/clear")
+            say_after = "Cleared. Fresh slate."
         elif verb == "compact":
             if router.active_id != "claude":
                 resp = ""
@@ -892,6 +1379,30 @@ async def amain():
                 key = str(CFG.get("ptt_key", "home")).replace("_", " ")
                 mouth.say(f"Push to talk. Hold the {key} key and "
                           "talk; the mic stays closed otherwise.")
+        elif verb == "replyphone":
+            resp = ""
+            _REPLY_TARGET_OVERRIDE["mode"] = "phone"
+            log("[console] reply routing -> phone only (override)")
+            mouth.say("Replies go to your phone only, until you say "
+                      "otherwise.")
+        elif verb == "replydesktop":
+            resp = ""
+            _REPLY_TARGET_OVERRIDE["mode"] = "desktop"
+            log("[console] reply routing -> desktop only (override)")
+            mouth.say("Replies go to the desktop only, until you say "
+                      "otherwise.")
+        elif verb == "replyboth":
+            resp = ""
+            _REPLY_TARGET_OVERRIDE["mode"] = "both"
+            log("[console] reply routing -> both (override)")
+            mouth.say("Replies go to both the desktop and your phone, "
+                      "until you say otherwise.")
+        elif verb == "replyauto":
+            resp = ""
+            _REPLY_TARGET_OVERRIDE["mode"] = None
+            log("[console] reply routing -> automatic (by origin)")
+            mouth.say("Back to automatic reply routing -- each reply "
+                      "goes to wherever you asked from.")
         elif verb == "noask":
             resp = ""
             _CONFIRM["verb"] = "noask"
@@ -943,18 +1454,24 @@ async def amain():
                           "voice line to get asking back.")
         elif verb == "useqwen":
             resp = ""
-            if router.active_id == "qwen3-8b-local":
-                line = "Already on Qwen."
+            already = router.active_id == "qwen3-8b-local"
+            _clear_external_lease()  # switching to a local brain clears it
+            if already:
+                line = _qwen_confirmation_line(router, already_active=True)
             else:
                 try:
                     await router.activate("qwen3-8b-local")
-                    line = "Switched to Qwen, local and free."
+                    line = _qwen_confirmation_line(router,
+                                                   already_active=False)
+                    day_journal.record_event("brain_switch",
+                                             "Switched to Qwen3 8B Local")
                 except (BrainDisabledError, BrainUnavailableError) as e:
                     line = f"Couldn't switch to Qwen: {e}"[:300]
             log(f"[console] useqwen -> {line}")
             mouth.say(line)
         elif verb == "usedeepseek":
             resp = ""
+            _clear_external_lease()  # switching to a local brain clears it
             if router.active_id == "deepseek-r1-8b-local":
                 line = "Already on DeepSeek local reasoning."
             else:
@@ -967,6 +1484,8 @@ async def amain():
                             "-- it thinks before it answers. Say "
                             "switch to Qwen when you want the fast "
                             "brain back.")
+                    day_journal.record_event(
+                        "brain_switch", "Switched to DeepSeek R1 8B Local")
                 except (BrainDisabledError, BrainUnavailableError) as e:
                     line = f"Couldn't switch to deep reasoning: {e}"[:300]
             log(f"[console] usedeepseek -> {line}")
@@ -979,21 +1498,51 @@ async def amain():
                 _CONFIRM["verb"] = "useclaude"
                 _CONFIRM["at"] = time.monotonic()
                 line = ("Switching to Claude uses your subscription "
-                        "usage and needs your approval every single "
-                        "time -- it's never saved as a default. Say "
-                        "confirm to switch, just for this session.")
+                        "usage and Agent tools. Confirming opens a "
+                        "thirty-minute session -- I'll ask again after "
+                        "thirty minutes of inactivity. Say confirm to "
+                        "switch.")
             log(f"[console] useclaude -> {line}")
             mouth.say(line)
         elif verb == "useclaude:confirmed":
             resp = ""
             try:
                 await router.activate("claude", confirmed=True)
-                line = ("Claude online for this session. Say switch "
-                        "to Qwen any time to go back.")
+                _start_external_lease("claude")
+                line = _claude_activated_line()
+                day_journal.record_event("brain_switch",
+                                         "Switched to Claude Agent SDK")
             except (BrainDisabledError, BrainUnavailableError,
                     ConfirmRequiredError) as e:
                 line = f"Couldn't reach Claude: {e}"[:300]
             log(f"[console] useclaude:confirmed -> {line}")
+            mouth.say(line)
+        elif verb == "usegemini":
+            resp = ""
+            if router.active_id == "gemini":
+                line = "Already on Gemini."
+            else:
+                _CONFIRM["verb"] = "usegemini"
+                _CONFIRM["at"] = time.monotonic()
+                line = ("Switching to Gemini sends your own words to "
+                        "an external service on your free tier. "
+                        "Confirming opens a thirty-minute session -- "
+                        "I'll ask again after thirty minutes of "
+                        "inactivity. Say confirm to switch.")
+            log(f"[console] usegemini -> {line}")
+            mouth.say(line)
+        elif verb == "usegemini:confirmed":
+            resp = ""
+            try:
+                await router.activate("gemini", confirmed=True)
+                _start_external_lease("gemini")
+                line = _gemini_activated_line()
+                day_journal.record_event("brain_switch",
+                                         "Switched to Gemini")
+            except (BrainDisabledError, BrainUnavailableError,
+                    ConfirmRequiredError) as e:
+                line = f"Couldn't reach Gemini: {e}"[:300]
+            log(f"[console] usegemini:confirmed -> {line}")
             mouth.say(line)
         elif verb == "whichbrain":
             resp = ""
@@ -1008,19 +1557,191 @@ async def amain():
                         "shouldn't happen. Check the log.")
             log(f"[console] whichbrain -> {line}")
             mouth.say(line)
+        elif verb == "brainscount":
+            resp = ""
+            # Always names all four numbered positions now (Brain 4,
+            # Gemini, explicitly as "not configured yet") -- the old
+            # enabled-only phrasing said "three configured brain
+            # modes" and silently dropped Gemini instead of naming it
+            # as the fourth, unconfigured slot, a real live-test
+            # complaint. Same function "list brains"/"brain options"
+            # already use, so the two questions now agree exactly.
+            line = _numbered_brain_menu(router)
+            log(f"[console] brainscount -> {line}")
+            mouth.say(line)
+        elif verb == "switchmemorybrain":
+            resp = ""
+            log(f"[console] switchmemorybrain -> {_MEMORY_BRAIN_LINE}")
+            mouth.say(_MEMORY_BRAIN_LINE)
+        elif verb == "memorymodules":
+            resp = ""
+            # A FIXED string, deliberately not built from router state:
+            # there is exactly one vault and that fact never varies by
+            # which brains are enabled or active, so there is nothing
+            # here that could ever go stale the way a brain-roster
+            # answer could.
+            log(f"[console] memorymodules -> {_MEMORY_MODULES_LINE}")
+            mouth.say(_MEMORY_MODULES_LINE)
         elif verb == "cloudbrain":
             resp = ""
-            # Never a direct activation: this path only ever informs
-            # and points at the exact confirm-gated phrase. Gemini is
-            # what "cloud brain" means here; Claude has its own name
-            # and its own exact phrase already.
-            line = ("Gemini is disabled -- no API key is configured, "
-                    "so that cloud brain isn't available. I can "
-                    "switch to Claude instead, which needs your "
-                    "explicit confirmation every time. Say switch to "
-                    "Claude if you'd like that.")
+            # Claude Agent SDK is the only real cloud brain -- this
+            # enters the SAME confirm gate "switch to Claude" uses
+            # (reusing _CONFIRM, never a separate mechanism), so
+            # "confirm" resolves it exactly like useclaude:confirmed
+            # below. Never mentions Gemini: it isn't configured, and
+            # naming it here would be exactly the kind of stale,
+            # config-drifting claim this whole fix exists to prevent.
+            already = router.active_id == "claude"
+            if not already:
+                _CONFIRM["verb"] = "useclaude"
+                _CONFIRM["at"] = time.monotonic()
+            line = _cloudbrain_line(already_active=already)
             log(f"[console] cloudbrain -> {line}")
             mouth.say(line)
+        elif verb == "ambiguousbrain":
+            resp = ""
+            # "switch to Gemini or Claude" -- never guess. No state
+            # change at all: the current brain stays exactly as it
+            # was, and nothing is armed on _CONFIRM.
+            line = "Do you mean Brain 3, Claude, or Brain 4, Gemini?"
+            log(f"[console] ambiguousbrain -> {line}")
+            mouth.say(line)
+        elif verb == "listbrains":
+            resp = ""
+            line = _numbered_brain_menu(router)
+            log(f"[console] listbrains -> {line}")
+            mouth.say(line)
+        elif verb == "switchask":
+            resp = ""
+            _BRAIN_NUM_PENDING["pending"] = True
+            _BRAIN_NUM_PENDING["at"] = time.monotonic()
+            mouth.say("Which brain number?")
+        elif verb == "switchnum:3":
+            resp = ""
+            already = router.active_id == "claude"
+            if not already:
+                _CONFIRM["verb"] = "switchnum:3"
+                _CONFIRM["at"] = time.monotonic()
+            line = _switchnum3_line(already_active=already)
+            log(f"[console] switchnum:3 -> {line}")
+            mouth.say(line)
+        elif verb == "switchnum:4":
+            resp = ""
+            # This ASK never constructs Gemini and never makes a
+            # network call -- it only speaks the required line and
+            # arms the same confirm gate "switch to Gemini" uses.
+            # Whether the key is actually present and healthy is
+            # decided at CONFIRM time by router.activate() itself
+            # (translated to usegemini:confirmed above), never
+            # pre-checked or duplicated here.
+            already = router.active_id == "gemini"
+            if not already:
+                _CONFIRM["verb"] = "switchnum:4"
+                _CONFIRM["at"] = time.monotonic()
+            line = _switchnum4_line(already_active=already)
+            log(f"[console] switchnum:4 -> {line}")
+            mouth.say(line)
+        elif verb == "closeday":
+            resp = ""
+            # The Day Journal service: a local, deterministic ledger
+            # summary, no brain and no network involved in building
+            # it. See day_journal.py -- this REPLACED the earlier
+            # design that asked Claude to write the note.
+            summary = day_journal.build_daily_summary()
+            log(f"[console] closeday event_count={summary.event_count} "
+                f"had_any_activity={summary.had_any_activity}")
+            _CONFIRM["verb"] = "closeday"
+            _CONFIRM["at"] = time.monotonic()
+            mouth.say(summary.spoken() + " Shall I save this to "
+                      "today's daily note? Say confirm to save.")
+        elif verb == "closeday:confirmed":
+            resp = ""
+            # Recomputed fresh rather than carried over from the
+            # initial ask: building the summary is cheap (one local
+            # ledger read, no network, no brain), so recomputing
+            # guarantees the note is never built from a stale
+            # snapshot -- and it's the exact same deterministic
+            # function, so nothing about the content can drift
+            # between what was spoken and confirmed.
+            summary = day_journal.build_daily_summary()
+            try:
+                day_journal.write_daily_note(summary)
+                say_after = "Saved to today's daily note."
+            except OSError as e:
+                say_after = f"Couldn't save the daily note: {e}"[:300]
+        elif verb == "pairphone":
+            resp = ""
+            phone_cfg = CFG.get("phone") or {}
+            mode = phone_cfg.get("mode") or "disabled"
+            if not (phone_cfg.get("enabled") and mode != "disabled"):
+                mouth.say("Phone access is turned off. Set phone.enabled "
+                          "to true and phone.mode to tailscale in "
+                          "backtalk.json, and restart, to pair a phone.")
+            elif not phone_bridge.bridge_url():
+                # start() already logged the specific reason (Tailscale
+                # not installed/running/signed in); the spoken line
+                # stays short and points at the log rather than guessing
+                mouth.say("The phone bridge isn't actually running -- "
+                          "check the terminal log for why. Tailscale "
+                          "may not be signed in.")
+            else:
+                # the trust step comes first, every time -- cheap to
+                # show again if already verified, and correct the one
+                # time it's genuinely a fresh phone or a rotated CA
+                phone_tls.print_verification_screen(
+                    phone_bridge._bind_ip, phone_bridge._port,
+                    phone_bridge._tls_port)
+                code, expires_at = phone_auth.create_pairing()
+                url = phone_bridge.bridge_url()
+                log("=" * 56)
+                log(f"[phone] PAIRING CODE (expires in "
+                    f"{phone_auth._CODE_TTL_S}s): {code}")
+                log(f"[phone] On the phone (signed into this Tailscale "
+                    f"network), open: {url}")
+                log("=" * 56)
+                # the code itself is deliberately never spoken aloud --
+                # eight random letters/digits read out loud invites a
+                # mis-hearing; the terminal is the trusted channel here
+                mouth.say("Pairing code is ready. Check the terminal "
+                          "screen for the code and the address to open "
+                          "on the phone.")
+        elif verb == "showphonecert":
+            resp = ""
+            phone_cfg = CFG.get("phone") or {}
+            if (phone_cfg.get("mode") or "disabled") != "tailscale":
+                mouth.say("There's no certificate to show -- phone.mode "
+                          "isn't set to tailscale.")
+            elif not phone_bridge.bridge_url():
+                mouth.say("The phone bridge isn't actually running -- "
+                          "check the terminal log for why.")
+            else:
+                phone_tls.print_verification_screen(
+                    phone_bridge._bind_ip, phone_bridge._port,
+                    phone_bridge._tls_port)
+                mouth.say("Certificate fingerprint is on the terminal "
+                          "screen.")
+        elif verb == "listphones":
+            resp = ""
+            devices = phone_auth.list_devices()
+            if not devices:
+                mouth.say("No phones are paired yet.")
+            else:
+                lines = [f"{i}. {d['label']}" for i, d in enumerate(devices, 1)]
+                log("[phone] paired devices: " + "; ".join(lines))
+                mouth.say(f"{len(devices)} phone"
+                          f"{'s' if len(devices) != 1 else ''} paired: "
+                          + ", ".join(lines) + ". Say revoke phone and "
+                          "the number to remove one.")
+        elif verb.startswith("revokephone:"):
+            resp = ""
+            idx = int(verb.split(":", 1)[1])
+            label = phone_auth.revoke_device(idx)
+            if label:
+                mouth.say(f"Revoked {label}. It will need to be paired "
+                          "again to reconnect.")
+            else:
+                mouth.say("There's no phone at that number. Say list "
+                          "paired phones to see the current list.")
         else:
             resp = ""
         if say_after:
@@ -1034,10 +1755,17 @@ async def amain():
                 mouth.say(say_after)
         signals.set_state("idle")
 
-    async def handle(text: str, spoke_from: float | None = None) -> bool:
+    async def handle(text: str, spoke_from: float | None = None,
+                     source_platform: str = "desktop") -> bool:
         """Process one utterance; returns False on quit. spoke_from is
         when the utterance STARTED (the PTT press), so an answer can be
-        told apart from speech that began before the ask even existed."""
+        told apart from speech that began before the ask even existed.
+        source_platform (2026-09-21, active-platform routing) is where
+        THIS utterance came from -- "desktop" for every existing
+        caller (typed stdin, PTT, open mic), "phone" only when
+        typed_fut's result unwraps a phone_bridge.PhoneTurn. Used
+        below (see _resolve_reply_targets) to decide which speaker(s)
+        the reply's audio should reach."""
         nonlocal speak_task
         log(f"[you]    {text}")
         # A pending spoken permission ask owns the next utterance IF
@@ -1066,14 +1794,65 @@ async def amain():
         if _CONFIRM["verb"]:
             pend, _CONFIRM["verb"] = _CONFIRM["verb"], None
             expired = time.monotonic() - _CONFIRM["at"] > 120
-            if not expired and _norm_speech(text) in (
-                    "confirm", "confirmed", "yes confirm",
-                    "yes confirmed"):
+            if not expired and _is_confirm_phrase(text):
                 verb = pend + ":confirmed"
             elif not expired and not any(q in text.lower()
                                          for q in QUIT_PHRASES):
                 mouth.say("Staying as we are.")
                 return True
+        # A pending external-lease consent (Claude or Gemini, after
+        # first switch-confirm or after a 30-minute idle expiry) owns
+        # the next utterance too: only an accepted confirm phrase
+        # sends the exact text that was previewed; anything else
+        # declines it outright, never a silent retry, never a silent
+        # skip. Separate from _CONFIRM above on purpose -- see
+        # _EXTERNAL_PENDING and _EXTERNAL_LEASE.
+        if _EXTERNAL_PENDING["text"] is not None:
+            pending_text = _EXTERNAL_PENDING["text"]
+            pending_brain = _EXTERNAL_PENDING["brain_id"]
+            _EXTERNAL_PENDING["text"] = None
+            _EXTERNAL_PENDING["brain_id"] = None
+            expired = time.monotonic() - _EXTERNAL_PENDING["at"] > PERM_TIMEOUT_S
+            if (not expired and _is_confirm_phrase(text)
+                    and router.active_id == pending_brain):
+                _start_external_lease(pending_brain)
+                _log_external_send(pending_brain, pending_text)
+                signals.set_state("thinking")
+                signals.static_start()
+                speak_task = asyncio.create_task(
+                    speak_reply(router, mouth, pending_text,
+                               targets=_resolve_reply_targets(source_platform)))
+                return True
+            elif not expired and not any(q in text.lower()
+                                         for q in QUIT_PHRASES):
+                mouth.say("Not sent.")
+                signals.set_state("idle")
+                return True
+            # expired, the active brain changed meanwhile, or a quit
+            # phrase: fall through to normal handling
+        # A bare "switch" owns the next utterance too: only a bare
+        # number resolves it (never plain conversation), and only
+        # within the timeout window.
+        if _BRAIN_NUM_PENDING["pending"]:
+            _BRAIN_NUM_PENDING["pending"] = False
+            expired = (time.monotonic() - _BRAIN_NUM_PENDING["at"]
+                      > PERM_TIMEOUT_S)
+            if not expired:
+                num = _bare_brain_number(text)
+                if num:
+                    verb = f"switchnum:{num}"
+                elif not any(q in text.lower() for q in QUIT_PHRASES):
+                    mouth.say("That's not a brain number I recognize. "
+                              "Say switch, then a number one through "
+                              "four.")
+                    return True
+            # expired, unrecognized, or a quit phrase: fall through
+        # "Confirm" said with nothing actually pending above must
+        # never fall through to a local brain and get answered as an
+        # ordinary question -- it explains itself and stops there.
+        if verb is None and _is_confirm_phrase(text):
+            mouth.say("There's no pending switch to confirm.")
+            return True
         if any(q in text.lower() for q in QUIT_PHRASES):
             if speak_task and not speak_task.done():
                 speak_task.cancel()
@@ -1117,7 +1896,35 @@ async def amain():
         # wait on a ResultMessage the CLI is withholding for an answer.
         _deny_pending()
         await router.reset_turn()
-        speak_task = asyncio.create_task(speak_reply(router, mouth, text))
+        active_brain = router.get(router.active_id) if router.active_id else None
+        if active_brain and active_brain.requires_external_lease:
+            if _external_lease_active(router.active_id):
+                # Lease still valid: refresh the idle window (this IS
+                # a use) and fall through to the normal answer path
+                # below -- no repeated warning, no repeated confirm.
+                _start_external_lease(router.active_id)
+                _log_external_send(router.active_id, text)
+            else:
+                # No valid lease -- never confirmed this brain yet, or
+                # the lease expired from thirty minutes of inactivity.
+                # Show the EXACT text that would be sent and wait for
+                # an explicit confirm before any real external call.
+                # No answer is generated here -- see _EXTERNAL_PENDING's
+                # resolution above for what happens once (or if) it's
+                # approved.
+                preview = active_brain.build_request_preview(text)
+                _EXTERNAL_PENDING["text"] = text
+                _EXTERNAL_PENDING["brain_id"] = router.active_id
+                _EXTERNAL_PENDING["at"] = time.monotonic()
+                line = _external_preview_line(router.active_id, preview)
+                log(f"[console] {router.active_id} preview -> {line}")
+                mouth.say(line)
+                signals.set_state("idle")
+                return True
+        rec = recommend.recommend(text, router)
+        speak_task = asyncio.create_task(
+            _answer_then_recommend(router, mouth, text, rec,
+                                   targets=_resolve_reply_targets(source_platform)))
         return True
 
     try:
@@ -1163,8 +1970,18 @@ async def amain():
             done, _ = await asyncio.wait(
                 waiters, return_when=asyncio.FIRST_COMPLETED)
             if typed_fut in done:
-                text = typed_fut.result(); typed_fut = None
-                if text and not await handle(text):
+                item = typed_fut.result(); typed_fut = None
+                # 2026-09-21, active-platform routing: phone_bridge
+                # puts a PhoneTurn wrapper on this SAME queue for
+                # phone-originated text/voice; every desktop reader
+                # (stdin, both cbreak and pipe modes) still puts a bare
+                # str, unchanged -- so this is the ONE place that tells
+                # a phone turn apart from a desktop one.
+                if isinstance(item, phone_bridge.PhoneTurn):
+                    text, source_platform = item.text, "phone"
+                else:
+                    text, source_platform = item, "desktop"
+                if text and not await handle(text, source_platform=source_platform):
                     return
                 continue
             if mic_fut is not None and mic_fut in done:

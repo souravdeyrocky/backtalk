@@ -87,6 +87,18 @@ class BrainAdapter:
     label: str = "Base brain (do not use directly)"
     requires_tools: bool = False
     requires_confirm_to_switch: bool = False
+    # True for Claude and Gemini: distinct from requires_confirm_to_switch,
+    # which gates the one-time SWITCH onto this brain. An "external"
+    # brain additionally needs a live consent LEASE -- confirming once
+    # opens a 30-minute idle window (main.py's _EXTERNAL_LEASE) during
+    # which requests send without re-asking; after 30 minutes of
+    # inactivity the lease has expired and the next request shows its
+    # exact outgoing text and asks for consent again, same as the
+    # first time. This used to mean "ask before literally every single
+    # request" (Gemini only) -- replaced by the lease because that was
+    # more friction than the actual risk warranted, without changing
+    # what gets disclosed or when consent is genuinely required.
+    requires_external_lease: bool = False
     capability_summary: str = "no capabilities declared"
 
     def __init__(self, *, enabled: bool = False):
@@ -156,6 +168,17 @@ class BrainAdapter:
     async def ask_stream(self, utterance: str) -> AsyncIterator[str]:
         raise NotImplementedError
         yield ""  # pragma: no cover -- keeps this an async generator
+
+    def build_request_preview(self, utterance: str) -> str:
+        """The exact text an "external" brain (requires_external_lease)
+        would send, shown for consent before the first send and again
+        after any 30-minute idle expiry. Default: the bare utterance,
+        unmodified -- correct for every current external brain (Claude
+        and Gemini both only ever receive exactly what Captain said,
+        nothing auto-attached); a brain that DID attach extra context
+        would need to override this so the preview always matches what
+        actually gets sent."""
+        return utterance.strip()
 
     async def command(self, cmd: str) -> str:
         raise NotImplementedError

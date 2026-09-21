@@ -39,8 +39,14 @@ _PATTERNS = (
     r"\b(edit|write|create|delete|save)\b[^?!]{0,40}\bfile\b",
     r"\brun\b[^?!]{0,40}\b(command|script|powershell|bash|terminal)\b",
     r"\bexecute\b[^?!]{0,40}\b(command|script)\b",
-    r"\b(browse|fetch|open)\b[^?!]{0,40}\b(website|url|web page|link|http)\b",
-    r"\b(remember|save|write|update)\b[^?!]{0,40}\b(vault|memory|notes?)\b",
+    # "search the internet" is a real field-test miss: the original
+    # pattern only recognized "browse/fetch/open" as the verb and
+    # never matched "search", so it reached Qwen unfiltered and got a
+    # confused, invented answer instead of the deterministic refusal.
+    r"\b(browse|fetch|open|search)\b[^?!]{0,40}"
+    r"\b(website|url|web page|link|http|internet|the web)\b",
+    r"\b(remember|save|write|update|add)\b[^?!]{0,40}"
+    r"\b(vault|memory|notes?|your world|daily note)\b",
 )
 # NOTE: the span excludes only "?" and "!" as hard stops, not ".", on
 # purpose -- a bare period shows up constantly inside the exact things

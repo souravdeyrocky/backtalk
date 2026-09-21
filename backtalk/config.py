@@ -183,6 +183,56 @@ DEFAULTS = {
                    "acompressor=threshold=-18dB:ratio=2.5:attack=8:"
                    "release=120:makeup=4dB,alimiter=limit=0.95"),
     },
+    # PHONE ACCESS (2026-09, REMOTE ONLY via Tailscale -- there is no
+    # LAN/home-Wi-Fi mode any more, by Captain's explicit call): OFF by
+    # default on purpose -- same opt-in pattern as elevenlabs.enabled/
+    # show_usage above. When enabled, backtalk starts an in-process
+    # FastAPI bridge bound ONLY to this machine's Tailscale interface
+    # IP, reachable only by a device signed into the SAME private
+    # tailnet AND separately paired with Jarvis (two independent access
+    # layers). It never adds a second brain route or a second identity,
+    # and never opens a public/internet-facing or LAN-facing port.
+    "phone": {
+        # Master switch. False stops everything, in EVERY mode below --
+        # this is checked first and independently of "mode", so a
+        # leftover or mistyped mode value can never turn the bridge on
+        # by itself.
+        "enabled": False,
+        # Explicit mode, not a second overlapping boolean (Captain's
+        # call, 2026-09-27: "replace ambiguous booleans with an
+        # explicit phone mode"). Consulted only when enabled is true;
+        # "disabled" here is ALSO a full stop even if enabled were
+        # somehow left true -- two independent ways to mean "off",
+        # both actually mean it.
+        #   "disabled"   - no listeners at all. Also the safe fallback
+        #                  for any unrecognized value, including the
+        #                  retired "typed_http"/"tls" values from the
+        #                  abandoned LAN design.
+        #   "tailscale"  - the only real mode. `port` below serves ONLY
+        #                  the CA certificate bootstrap/verification
+        #                  page (never the app, never pairing, never
+        #                  approvals); `tls_port` serves the full app
+        #                  over HTTPS, mic included. Both bind ONLY to
+        #                  phone_auth.detect_tailscale_ip() (or
+        #                  bind_ip below if set) -- never the LAN,
+        #                  never 0.0.0.0. If Tailscale isn't installed/
+        #                  running/signed in, nothing starts at all;
+        #                  see phone_bridge.start(). See phone_tls.py
+        #                  for the certificate design -- there is no
+        #                  HTTP fallback for the app, by design.
+        "mode": "disabled",
+        # Port for the certificate-bootstrap page (plain HTTP, Tailscale-
+        # bound). Change only if 8765 collides with something else.
+        "port": 8765,
+        # The full HTTPS app's port. Change only if 8766 collides.
+        "tls_port": 8766,
+        # "" auto-detects this machine's Tailscale interface IP (via
+        # `tailscale ip -4` -- see phone_auth.detect_tailscale_ip)
+        # -- deliberately NEVER the LAN, NEVER 0.0.0.0. Set a specific
+        # address here only if you have a reason to override the
+        # Tailscale CLI's own answer.
+        "bind_ip": "",
+    },
     # Where the signal-bus files are written (.voice_state,
     # .voice_waveform, .voice_loading_pid) — anything can watch them;
     # visualizers pair with this contract. Default: the repo root.

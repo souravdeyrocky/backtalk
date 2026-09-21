@@ -17,6 +17,10 @@ backtalk.json
 # by default (see brain_router.json.example), and this file is where you
 # turn one on for real
 brain_router.json
+# same story again for the pronunciation dictionary -- personal
+# corrections, seeded with defaults (see pronunciation.json.example),
+# never tracked, never touched by updates
+pronunciation.json
 
 # Other agents' configs living beside this one. They are not backtalk's, they are
 # not the user's copy of backtalk's, and nothing here should ever carry them.
@@ -26,3 +30,11 @@ show.json
 .python-version
 # Config backups the setup wizard leaves behind.
 *.json.*.bak
+
+# Paired-phone device store (device labels + token HASHES only, never
+# the raw tokens) -- this machine's pairings, never tracked.
+.phone_devices.json
+
+# phone.mode "tls" -- this machine's local CA + leaf cert/keys. The CA
+# private key must never leave this machine, let alone be committed.
+.phone_tls/

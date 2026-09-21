@@ -26,6 +26,51 @@ class ToolIntentDetectionTests(unittest.TestCase):
         self.assertTrue(looks_like_tool_request(
             "remember this in my vault: call the dentist tomorrow"))
 
+    def test_real_field_transcript_write_this_in_your_world(self):
+        # Real live-test failure: "your world" is how Captain refers to
+        # the vault/memory, and it never matched the vault-target
+        # alternation (vault|memory|notes), so this reached Qwen
+        # unfiltered instead of the deterministic Claude-escalation
+        # refusal.
+        self.assertTrue(looks_like_tool_request("write this in your world"))
+
+    def test_real_field_transcript_write_this_in_memory(self):
+        self.assertTrue(looks_like_tool_request("write this in memory"))
+
+    def test_real_field_transcript_write_about_models_in_memory(self):
+        self.assertTrue(looks_like_tool_request(
+            "write about your models in memory"))
+
+    def test_real_field_transcript_add_a_daily_note(self):
+        # Real live-test failure: "add" was never in the verb
+        # alternation (remember|save|write|update), so this slipped
+        # past even though "daily note" is plainly a vault write.
+        self.assertTrue(looks_like_tool_request("add a daily note"))
+
+    def test_real_field_transcript_save_this_note(self):
+        self.assertTrue(looks_like_tool_request("save this note"))
+
+    def test_real_field_transcript_search_the_internet(self):
+        # Real live-test failure: this exact phrase reached DeepSeek
+        # unfiltered (the original pattern only recognized "browse/
+        # fetch/open" as the verb, never "search"), and DeepSeek
+        # answered in prose ("I'm sorry, but I can't search the
+        # internet...") instead of the deterministic refusal -- and it
+        # never offered the confirm-gated Claude escalation by name.
+        self.assertTrue(looks_like_tool_request(
+            "Jarvis, can you search the Internet and find about "
+            "Kasturi Nursing Home?"))
+
+    def test_search_the_web_variant(self):
+        self.assertTrue(looks_like_tool_request(
+            "can you search the web for that"))
+
+    def test_ordinary_search_without_web_target_not_flagged(self):
+        # "search" alone must not become a trigger word -- only
+        # web-shaped search requests should refuse.
+        self.assertFalse(looks_like_tool_request(
+            "search your memory for what I said earlier"))
+
     def test_ordinary_conversation_is_not_flagged(self):
         self.assertFalse(looks_like_tool_request(
             "what's a good name for a dog"))
